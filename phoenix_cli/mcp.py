@@ -426,13 +426,14 @@ class MCPClient:
         return cls(transport=transport, name=name)
 
     async def connect(self) -> None:
+        from . import __version__
         await self._transport.start()
         # MCP handshake.
         try:
             await self._transport.send_request("initialize", {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "phoenix-cli", "version": "1.0.0"},
+                "clientInfo": {"name": "phoenix-cli", "version": __version__},
             })
             await self._transport.send_notification(
                 "notifications/initialized"

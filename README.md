@@ -86,7 +86,8 @@ render unhighlighted.
 
 ## 2. Initial setup
 
-Run `phoenix setup`. It asks three questions (the API key is hidden):
+Run `phoenix setup`. It asks three questions (the API key is hidden — ● bullets
+appear as you type so you know input is being received):
 
 ```
 $ phoenix setup
