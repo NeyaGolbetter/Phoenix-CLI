@@ -166,7 +166,12 @@ class PhoenixClient:
 
     async def open(self) -> None:
         """Create the underlying httpx client (call before chatting)."""
-        headers = {"Content-Type": "application/json", **self.extra_headers}
+        from . import __version__
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"phoenix-cli/{__version__}",
+            **self.extra_headers,
+        }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         self._client = httpx.AsyncClient(

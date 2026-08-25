@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import pty
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -304,3 +306,160 @@ def test_status_shows_mcp(clean_env, monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert "MCP" in result.output
     assert "enabled" in result.output
+
+
+# ---------------------------------------------------------------------------
+# API key secure-input regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_hidden_input_raw_reads_key_in_pty():
+    """_hidden_input_raw must read a typed API key via PTY and not hang."""
+    import os, pty, select, signal, time as _time
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        import os as _os
+        _os.environ["PHOENIX_CONFIG"] = "/tmp/test_hidden_input_config.json"
+        for v in ("PHOENIX_BASE_URL", "PHOENIX_API_KEY", "PHOENIX_MODEL"):
+            _os.environ.pop(v, None)
+        sys.path.insert(0, str(REPO_ROOT))
+        from phoenix_cli.cli import _hidden_input_raw
+        result = _hidden_input_raw("prompt> ")
+        print(f"__GOT__={result!r}", flush=True)
+        os._exit(0)
+
+    all_out = b""
+
+
+# ---------------------------------------------------------------------------
+# API key secure-input regression tests
+# ---------------------------------------------------------------------------
+
+
+def _drain_pty(fd, timeout=2):
+    """Read all available data from a PTY fd with a generous timeout."""
+    import select as _sel, time as _t
+    deadline = _t.time() + timeout
+    out = b""
+    got_data_recently = True
+    while _t.time() < deadline:
+        r, _, _ = _sel.select([fd], [], [], 0.2)
+        if fd in r:
+            try:
+                d = os.read(fd, 4096)
+                if d:
+                    out += d
+                    got_data_recently = True
+                    deadline = _t.time() + 1.0  # extend timeout on data
+                else:
+                    if got_data_recently:
+                        got_data_recently = False
+                        _t.sleep(0.3)  # wait briefly for more
+                    else:
+                        break
+            except OSError:
+                break
+        else:
+            if got_data_recently:
+                got_data_recently = False
+    return out
+
+
+def _wait_for_prompt_and_send(fd, marker, response, wait_before_send=0.5, initial_timeout=10):
+    """Wait for marker then send response; return all bytes read."""
+    import select as _sel, time as _t
+    all_out = b""
+    deadline = _t.time() + initial_timeout
+    sent = False
+    while _t.time() < deadline:
+        r, _, _ = _sel.select([fd], [], [], 0.3)
+        if fd in r:
+            try:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                all_out += data
+            except OSError:
+                break
+        if not sent and marker in all_out:
+            _t.sleep(wait_before_send)
+            os.write(fd, response)
+            sent = True
+            break
+    return all_out, sent
+
+
+@pytest.mark.skipif(not hasattr(pty, "fork") or not hasattr(os, "openpty"),
+                    reason="PTY tests require a PTY-capable POSIX system")
+def test_hidden_input_raw_reads_key_in_pty():
+    """_hidden_input_raw must read a typed API key via PTY and not hang."""
+    import signal, time as _time
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["PHOENIX_CONFIG"] = "/tmp/test_hidden_input_config.json"
+        for v in ("PHOENIX_BASE_URL", "PHOENIX_API_KEY", "PHOENIX_MODEL"):
+            os.environ.pop(v, None)
+        sys.path.insert(0, str(REPO_ROOT))
+        # Re-flush before exec-like behavior since we forked
+        sys.stdout.flush()
+        from phoenix_cli.cli import _hidden_input_raw
+        result = _hidden_input_raw("prompt> ")
+        # Use os write directly to print result to avoid Rich interference
+        os.write(1, f"__GOT__={result!r}\n".encode())
+        os._exit(0)
+
+    _, sent = _wait_for_prompt_and_send(fd, b"prompt>", b"sk-regression-test-42\r")
+    assert sent, "Prompt marker never appeared"
+    all_out = _drain_pty(fd, timeout=3)
+
+    try:
+        _, s = os.waitpid(pid, os.WNOHANG)
+        if s == 0:
+            os.kill(pid, signal.SIGTERM)
+            _time.sleep(0.3)
+            os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+
+    out = all_out.decode("utf-8", errors="replace")
+    assert "sk-regression-test-42" in out, f"Key not received; tail: {out[-400:]}"
+
+
+@pytest.mark.skipif(not hasattr(pty, "fork") or not hasattr(os, "openpty"),
+                    reason="PTY tests require a PTY-capable POSIX system")
+def test_hidden_input_raw_handles_backspace_in_pty():
+    """Backspace must erase the previous character (typed 'abcd' + 3 BS + 'x' → 'ax')."""
+    import signal, time as _time
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["PHOENIX_CONFIG"] = "/tmp/test_bs_config.json"
+        for v in ("PHOENIX_BASE_URL", "PHOENIX_API_KEY", "PHOENIX_MODEL"):
+            os.environ.pop(v, None)
+        sys.path.insert(0, str(REPO_ROOT))
+        sys.stdout.flush()
+        from phoenix_cli.cli import _hidden_input_raw
+        result = _hidden_input_raw("pw> ")
+        os.write(1, f"__BS__={result!r}\n".encode())
+        os._exit(0)
+
+    _, sent = _wait_for_prompt_and_send(
+        fd, b"pw>", b"abcd" + b"\x7f\x7f\x7f" + b"x\r"
+    )
+    assert sent, "Prompt marker never appeared"
+    all_out = _drain_pty(fd, timeout=3)
+
+    try:
+        _, s = os.waitpid(pid, os.WNOHANG)
+        if s == 0:
+            os.kill(pid, signal.SIGTERM)
+            _time.sleep(0.3)
+            os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+
+    out = all_out.decode("utf-8", errors="replace")
+    assert "__BS__=" in out, f"Result marker missing; tail: {out[-400:]}"
+    assert "'ax'" in out, f"Backspace result wrong; tail: {out[-400:]}"

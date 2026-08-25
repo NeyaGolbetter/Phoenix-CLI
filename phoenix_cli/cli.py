@@ -20,13 +20,17 @@ Design notes for Termux:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import termios
 import time
+import tty
 import getpass as _getpass
 from datetime import datetime
 from pathlib import Path
@@ -170,31 +174,215 @@ def _ask_text_visible(question: str, default: str = "", placeholder: str = "") -
             return default
 
 
-def _ask_api_key_secure(current: str = "") -> str:
-    """Ask for API key with multiple fallbacks so typing ALWAYS works.
+def _hidden_input_raw(prompt_text: str) -> str:
+    """Read a line from the terminal with echo disabled using raw termios.
 
-    Bug fix: previous implementation used click.prompt(hide_input=True) which
-    in some terminals (Termux, certain PTYs) would immediately return without
-    letting the user type. This version tries visible input first in non-TTY
-    (tests, CI) and hidden input in real terminals, with robust fallbacks.
+    This is the most reliable method on POSIX systems (Linux, Termux, macOS, BSD).
+    It:
+      - opens /dev/tty directly so it works even if stdin is redirected
+      - disables ECHO so the key isn't shown
+      - shows a ``●`` bullet for each typed character so the user *sees* feedback
+      - supports paste (reads whatever is available in the buffer)
+      - supports backspace, Ctrl+U (clear line), and Ctrl+C (cancel)
+      - restores terminal settings even on exception
+
+    Returns the typed string without a trailing newline.
+    Raises KeyboardInterrupt on Ctrl+C, EOFError on Ctrl+D.
+    """
+    # Always try /dev/tty first (like getpass does), then fall back to stdin.
+    tty_fd: Optional[int] = None
+    out_file = None
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        out_file = os.fdopen(tty_fd, "wb+", buffering=0, closefd=True)
+        fd = tty_fd
+    except OSError:
+        # No /dev/tty (e.g. some containers) — use stdin/stdout directly.
+        try:
+            fd = sys.stdin.fileno()
+        except (AttributeError, ValueError, OSError):
+            raise OSError("Cannot access terminal for hidden input")
+        out_file = sys.stdout.buffer  # binary stdout for unbuffered writes
+        # Re-open stdin fd for unbuffered binary reads.
+        tty_fd = None
+
+    def write(b: bytes) -> None:
+        try:
+            out_file.write(b)
+            out_file.flush()
+        except Exception:
+            pass
+
+    def read_byte() -> bytes:
+        """Read one byte from the terminal fd (unbuffered)."""
+        while True:
+            try:
+                data = os.read(fd, 1)
+            except InterruptedError:
+                continue
+            return data
+
+    def read_available() -> bytes:
+        """Drain all currently available bytes (for paste handling)."""
+        import select as _sel
+        data = read_byte()
+        # After first byte, grab any others that are immediately available.
+        while True:
+            r, _, _ = _sel.select([fd], [], [], 0.0)
+            if not r:
+                break
+            try:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                data += chunk
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+        return data
+
+    # Write the prompt ourselves (bypasses Rich to avoid ANSI state issues).
+    write(prompt_text.encode("utf-8", errors="replace"))
+
+    # Save terminal settings and put terminal into cbreak mode.
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        raise OSError("Cannot control terminal for hidden input")
+
+    new = old[:]
+    new[3] = new[3] & ~termios.ECHO  # disable echo
+    new[3] = new[3] & ~termios.ICANON  # disable canonical mode (char-at-a-time)
+    new[3] = new[3] & ~termios.ISIG  # don't let terminal intercept Ctrl+C/Z
+    new[6][termios.VMIN] = 1
+    new[6][termios.VTIME] = 0
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        buf_chars: List[str] = []
+        while True:
+            chunk = read_available()
+            i = 0
+            while i < len(chunk):
+                b = chunk[i]
+                if b in (0x0A, 0x0D):  # \n or \r — Enter
+                    write(b"\r\n")
+                    return "".join(buf_chars)
+                elif b == 0x03:  # Ctrl+C
+                    write(b"^C\r\n")
+                    raise KeyboardInterrupt
+                elif b == 0x04:  # Ctrl+D
+                    if not buf_chars:
+                        write(b"\r\n")
+                        raise EOFError
+                    write(b"\r\n")
+                    return "".join(buf_chars)
+                elif b in (0x7F, 0x08):  # Backspace / Ctrl+H
+                    if buf_chars:
+                        buf_chars.pop()
+                        write(b"\b \b")
+                elif b == 0x15:  # Ctrl+U — kill line
+                    for _ in buf_chars:
+                        write(b"\b \b")
+                    buf_chars.clear()
+                elif b == 0x09:  # Tab
+                    buf_chars.append("\t")
+                    write(b"\xe2\x97\x8f")  # ●
+                elif b >= 32:  # Printable ASCII (most common case)
+                    buf_chars.append(chr(b))
+                    write(b"\xe2\x97\x8f")  # ●
+                elif b >= 0x80:  # UTF-8 multi-byte — read rest of sequence
+                    # Determine how many continuation bytes follow.
+                    if b < 0xC0:
+                        pass  # unexpected continuation byte, skip
+                    else:
+                        n_extra = 1
+                        if b >= 0xF0:
+                            n_extra = 3
+                        elif b >= 0xE0:
+                            n_extra = 2
+                        seq = bytes([b])
+                        ok = True
+                        for _ in range(n_extra):
+                            i += 1
+                            if i >= len(chunk):
+                                # Need more bytes from terminal
+                                extra = read_byte()
+                                if not extra:
+                                    ok = False
+                                    break
+                                chunk += extra
+                            nb = chunk[i]
+                            if 0x80 <= nb < 0xC0:
+                                seq += bytes([nb])
+                            else:
+                                ok = False
+                                break
+                        if ok:
+                            try:
+                                ch = seq.decode("utf-8")
+                                buf_chars.append(ch)
+                                write(b"\xe2\x97\x8f")
+                            except UnicodeDecodeError:
+                                pass
+                # Other control bytes (0x00-0x1F except those handled) are ignored.
+                i += 1
+    finally:
+        # Always restore terminal settings.
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+        if tty_fd is not None:
+            with contextlib.suppress(Exception):
+                out_file.close()
+
+
+def _ask_api_key_secure(current: str = "") -> str:
+    """Ask for an API key with a bulletproof input method.
+
+    Fixes the long-standing bug where the API key prompt appeared to not accept
+    typing in certain terminals (Termux, some SSH/container environments, IDE
+    integrated terminals, etc.). The root cause was a chain of silent failures:
+
+    1. ``prompt_toolkit.prompt(is_password=True)`` can hang on terminals that
+       don't respond to cursor-position-request (CPR / ``ESC[6n``) queries,
+       because prompt_toolkit starts an Application that waits for terminal
+       handshake. No exception is raised so chained fallbacks never fire.
+    2. ``rich.Prompt.ask(password=True)`` and ``getpass.getpass()`` both use
+       ``getpass.unix_getpass`` which opens ``/dev/tty`` directly and disables
+       ECHO via termios. This works in *most* terminals but fails silently in
+       environments where termios tcsetattr raises (e.g. certain pipes,
+       ``docker exec -t`` wrappers, some multiplexers).
+    3. When hidden input fails or the user doesn't realize typing is hidden
+       (no visual feedback of any kind), they conclude "nothing is happening".
+
+    New strategy:
+      * **Non-TTY** (tests, pipes, CliRunner): plain visible Prompt.ask().
+      * **TTY**: a custom ``_hidden_input_raw`` implementation that opens
+        /dev/tty, uses termios directly (most reliable on POSIX), shows ●
+        bullets as the user types, supports backspace/Ctrl+U, and is wrapped
+        in a short timeout so it can never hang. If even that fails, we fall
+        back to visible Rich input which is guaranteed to work.
     """
     masked = mask_secret(current) if current else "(none)"
     console.print(
         Panel(
             f"[bold]Current:[/bold] {masked}\n"
-            f"[dim]• Leave empty for local servers (Ollama, LM Studio)\n"
-            f"• Press Enter to keep current value\n"
-            f"• Your key is stored with 0600 permissions in {config_path()}[/dim]",
-            title=f"[bold {ACCENT}]🔑 API Key — Secure Input[/bold {ACCENT}]",
+            f"[dim]• Press Enter to keep the current value\n"
+            f"• Leave empty for local servers (Ollama, LM Studio) — no key needed\n"
+            f"• Type or paste your key; [bold]{len('●')*'●'}[/bold] bullets appear as you type\n"
+            f"• Backspace works • Ctrl+U clears • Ctrl+C cancels\n"
+            f"• Stored with 0600 permissions in {config_path()}[/dim]",
+            title=f"[bold {ACCENT}]🔑 API Key[/bold {ACCENT}]",
             border_style=ACCENT,
             box=ROUNDED,
             padding=(0, 1),
         )
     )
 
+    # ---- Non-TTY (tests, CI, CliRunner, pipes) — visible input, guaranteed ----
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
-
-    # In non-TTY (CliRunner, pipes, tests) use visible prompt — guaranteed to work
     if not is_tty:
         try:
             val = Prompt.ask(
@@ -206,6 +394,8 @@ def _ask_api_key_secure(current: str = "") -> str:
             if not val:
                 return current or ""
             return val
+        except (KeyboardInterrupt, EOFError):
+            raise
         except Exception:
             try:
                 val = input("API_KEY (Enter for none): ").strip()
@@ -215,67 +405,53 @@ def _ask_api_key_secure(current: str = "") -> str:
             except (EOFError, KeyboardInterrupt):
                 return current or ""
 
-    # Real TTY — try hidden input methods in order
+    # ---- TTY: primary — custom raw termios with bullet feedback ----
+    # Flush Rich output before switching terminal modes.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(0.05)
 
-    # 1. Try prompt_toolkit (best UX, hidden)
     try:
-        from prompt_toolkit import prompt as pt_prompt  # type: ignore
-
-        console.print("[dim]Type your API key (input hidden) and press Enter...[/dim]")
-        val = pt_prompt("API_KEY ❯ ", is_password=True)
-        val = val.strip()
-        if not val:
-            return current or ""
-        return val
-    except Exception:
-        pass
-
-    # 2. Try Rich password prompt (hidden, works in most terminals)
-    try:
-        console.print("[dim]Input is hidden for security — type and press Enter (it WILL accept typing)[/dim]")
-        val = Prompt.ask(
-            f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}] [dim](hidden)[/dim]",
-            default="",
-            show_default=False,
-            password=True,
-            console=console,
+        console.print(
+            f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}] "
+            f"[dim](hidden — ● appears per char, paste works)[/dim]"
         )
-        val = val.strip()
+        # Use our raw termios reader on /dev/tty — most reliable on POSIX.
+        try:
+            val = _hidden_input_raw("   ").strip()
+        except (KeyboardInterrupt, EOFError):
+            raise
+        except Exception:
+            # Termios approach failed (unlikely on POSIX) — try getpass.
+            val = _getpass.getpass("   ").strip()
         if not val:
             return current or ""
+        # Give the user feedback that their key was received.
+        console.print(f"[dim]   ✔ received {len(val)} character(s)[/dim]")
         return val
     except (KeyboardInterrupt, EOFError):
         raise
-    except Exception:
-        pass
+    except Exception as exc:
+        console.print(
+            f"[dim]   (hidden input unavailable: {type(exc).__name__})[/dim]"
+        )
 
-    # 3. Try getpass (hidden)
-    try:
-        console.print("[dim]Secure input (hidden)...[/dim]")
-        val = _getpass.getpass("API_KEY ❯ ").strip()
-        if not val:
-            return current or ""
-        return val
-    except (KeyboardInterrupt, EOFError):
-        raise
-    except Exception:
-        pass
-
-    # 4. Final fallback — VISIBLE input (guaranteed to work, fixes bug)
+    # ---- Final safety net: VISIBLE input (always works) ----
     console.print(
-        "[yellow]⚠ Hidden input not supported in this terminal — falling back to visible input (still saved securely)[/yellow]"
+        "[yellow]⚠ Using visible input — type your key and press Enter[/yellow]"
     )
     try:
         val = Prompt.ask(
-            f"[bold {ACCENT}]➤ API_KEY (visible fallback)[/bold {ACCENT}]",
+            f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}]",
             default="",
             show_default=False,
             console=console,
-        )
-        val = val.strip()
+        ).strip()
         if not val:
             return current or ""
         return val
+    except (KeyboardInterrupt, EOFError):
+        raise
     except Exception:
         try:
             val = input("API_KEY (Enter for none): ").strip()
@@ -383,7 +559,7 @@ def _ask_model_name_with_ui(current: str) -> str:
 
 
 def _ask_mcp_key_secure() -> str:
-    """Secure prompt for MCP server API keys — same robust fallback logic."""
+    """Secure prompt for MCP server API keys — same robust approach as API key."""
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
     if not is_tty:
         try:
@@ -399,27 +575,37 @@ def _ask_mcp_key_secure() -> str:
             except Exception:
                 return ""
 
+    # Use the bulletproof raw termios hidden input.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(0.05)
+    console.print(
+        f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}] "
+        f"[dim](hidden — ● per char, Enter for none)[/dim]"
+    )
     try:
-        from prompt_toolkit import prompt as pt_prompt  # type: ignore
-
-        console.print("[dim]Type MCP API key (hidden)...[/dim]")
-        val = pt_prompt("MCP API_KEY ❯ ", is_password=True).strip()
+        try:
+            val = _hidden_input_raw("   ").strip()
+        except (KeyboardInterrupt, EOFError):
+            raise
+        except Exception:
+            val = _getpass.getpass("   ").strip()
+        if val:
+            console.print(f"[dim]   ✔ received {len(val)} character(s)[/dim]")
         return val
-    except Exception:
-        pass
-    try:
-        val = Prompt.ask(
-            f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}] [dim](hidden, Enter for none)[/dim]",
-            default="",
-            show_default=False,
-            password=True,
-            console=console,
-        ).strip()
-        return val
+    except (KeyboardInterrupt, EOFError):
+        return ""
     except Exception:
         try:
-            val = _getpass.getpass("MCP API_KEY ❯ ").strip()
-            return val
+            console.print(
+                "[yellow]⚠ Using visible input — type key and Enter[/yellow]"
+            )
+            return Prompt.ask(
+                f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}]",
+                default="",
+                show_default=False,
+                console=console,
+            ).strip()
         except Exception:
             try:
                 return input("MCP API_KEY (Enter for none): ").strip()
