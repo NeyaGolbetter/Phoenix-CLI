@@ -31,3 +31,17 @@ def clean_env(monkeypatch, tmp_path):
     config_file = tmp_path / ".phoenix_config.json"
     monkeypatch.setenv("PHOENIX_CONFIG", str(config_file))
     return config_file
+
+
+@pytest.fixture()
+def cfg(clean_env):
+    """A loaded config dict, backed by a clean isolated environment."""
+    from phoenix_cli.config import load_config, save_config
+
+    save_config(
+        base_url="http://127.0.0.1:1/v1",
+        api_key="",
+        model_name="ok",
+        mcp_enabled=False,
+    )
+    return load_config()

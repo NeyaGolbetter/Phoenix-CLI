@@ -8,6 +8,8 @@ make Phoenix CLI provider-agnostic:
 * ``api_key``   - the provider's API key (can be anything for local servers)
 * ``model_name``- the model identifier the provider understands
 
+MCP server configs live in ``~/.phoenix_mcp.json`` (managed separately).
+
 Everything here is plain stdlib so configuration never depends on network
 access or optional packages.
 """
@@ -50,15 +52,20 @@ def config_path() -> Path:
 def normalize_base_url(raw: str) -> str:
     """Clean up a user-supplied base URL.
 
-    Strips whitespace and trailing slashes. If the URL has *no path at all*
-    (e.g. ``http://localhost:11434``), the OpenAI-compatibility suffix ``/v1``
-    is appended. Explicit paths are always respected as given, so
+    Strips whitespace and trailing slashes.  If no scheme is present,
+    ``http://`` is prepended automatically so that any hostname the user
+    types is accepted.  If the URL has *no path at all* (e.g.
+    ``http://localhost:11434``), the OpenAI-compatibility suffix ``/v1``
+    is appended.  Explicit paths are always respected as given, so
     ``https://api.openrouter.ai/api/v1`` or ``https://api.groq.com/openai/v1``
     are never rewritten.
     """
     url = (raw or "").strip().rstrip("/")
     if not url:
         return url
+    # Auto-prepend http:// when the user omits the scheme.
+    if "://" not in url:
+        url = "http://" + url
     rest = url.split("://", 1)[-1]
     path = rest.split("/", 1)[1] if "/" in rest else ""
     if not path:
@@ -75,13 +82,15 @@ def load_config() -> Dict[str, str]:
        ``PHOENIX_MODEL``).
     2. ``~/.phoenix_config.json``.
 
-    Returns a dict that always contains the keys ``base_url``, ``api_key`` and
-    ``model_name`` (possibly empty strings when unset). Never raises.
+    Returns a dict that always contains the keys ``base_url``, ``api_key``,
+    ``model_name`` and ``mcp_enabled`` (possibly empty strings / False when
+    unset). Never raises.
     """
     cfg: Dict[str, str] = {
         "base_url": os.environ.get(ENV_BASE_URL, ""),
         "api_key": os.environ.get(ENV_API_KEY, ""),
         "model_name": os.environ.get(ENV_MODEL, ""),
+        "mcp_enabled": "",
     }
     if os.environ.get(ENV_BASE_URL):
         cfg["base_url"] = normalize_base_url(cfg["base_url"])
@@ -105,6 +114,12 @@ def load_config() -> Dict[str, str]:
                     cfg[key] = normalize_base_url(value)
                 else:
                     cfg[key] = value.strip()
+        # Load the mcp_enabled flag (bool or "true"/"false" string).
+        mcp_val = raw.get("mcp_enabled")
+        if isinstance(mcp_val, bool):
+            cfg["mcp_enabled"] = mcp_val
+        elif isinstance(mcp_val, str):
+            cfg["mcp_enabled"] = mcp_val.lower() in ("true", "1", "yes")
 
     return cfg
 
@@ -114,11 +129,13 @@ def save_config(
     api_key: str,
     model_name: str,
     extra_headers: Dict[str, str] | None = None,
+    mcp_enabled: bool = False,
 ) -> Path:
     """Write the configuration to ``~/.phoenix_config.json``.
 
     ``extra_headers`` is stored for backwards/forwards compatibility with
     future Phoenix CLI releases but is not used by the 1.0 client.
+    ``mcp_enabled`` toggles MCP tool integration on/off.
     """
     path = config_path()
     payload: Dict[str, Any] = {
@@ -128,6 +145,7 @@ def save_config(
     }
     if extra_headers:
         payload["extra_headers"] = extra_headers
+    payload["mcp_enabled"] = mcp_enabled
 
     # Write atomically (temp file + rename) so an interrupted write never
     # leaves a half-written config behind.

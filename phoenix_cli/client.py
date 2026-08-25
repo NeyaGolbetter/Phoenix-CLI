@@ -147,11 +147,12 @@ class PhoenixClient:
         if not model_name:
             raise ConfigurationError("MODEL_NAME is empty")
 
-        # Reject clearly-invalid URLs before the first network round-trip.
-        if "://" not in base_url or " " in base_url:
+        # Normalize and validate the URL.  normalize_base_url will auto-add
+        # http:// if no scheme is present, so we only reject truly empty URLs.
+        if " " in base_url:
             raise ConfigurationError(
-                f"BASE_URL must include a scheme, e.g. http://localhost:11434/v1 "
-                f"(got: {base_url!r}). Did you mean to run `phoenix setup`?"
+                f"BASE_URL contains spaces (got: {base_url!r}). "
+                f"Did you mean to run `phoenix setup`?"
             )
 
         self.base_url = base_url.rstrip("/")
@@ -220,6 +221,8 @@ class PhoenixClient:
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Yield parsed SSE deltas from the chat-completions stream.
 
@@ -227,6 +230,9 @@ class PhoenixClient:
         delta) or ``{"usage": {...}, "finish_reason": ...}`` (a final usage
         chunk, when the provider sends one). Raises one of the error classes
         above on failure.
+
+        When ``tools`` is provided, the model may respond with tool calls.
+        These are yielded as ``{"tool_calls": [...]}`` chunks.
         """
         if self._client is None:
             raise ProviderError("Client is not open; call `open()` first")
@@ -236,6 +242,10 @@ class PhoenixClient:
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        if tools:
+            payload["tools"] = tools
+            if tool_choice:
+                payload["tool_choice"] = tool_choice
         try:
             async with self._client.stream(
                 "POST", self._url("chat/completions"), json=payload
@@ -247,6 +257,8 @@ class PhoenixClient:
 
                 usage: Dict[str, Any] = {}
                 finish_reason: Optional[str] = None
+                # Accumulate tool_calls from streaming deltas.
+                tool_call_buffers: Dict[int, Dict[str, Any]] = {}
                 async for line in response.aiter_lines():
                     if not line:
                         continue
@@ -284,9 +296,35 @@ class PhoenixClient:
                         if text:
                             yield {"content": text}
 
-                # vLLM sends `finish_reason` on the *last* chunk; emit a
-                # final bookkeeping item so callers can show token usage.
-                yield {"finish_reason": finish_reason, "usage": usage}
+                        # Accumulate streaming tool_calls deltas.
+                        tc_deltas = delta.get("tool_calls")
+                        if tc_deltas:
+                            for tc_delta in tc_deltas:
+                                idx = tc_delta.get("index", 0)
+                                if idx not in tool_call_buffers:
+                                    tool_call_buffers[idx] = {
+                                        "id": tc_delta.get("id", ""),
+                                        "type": tc_delta.get("type", "function"),
+                                        "function": {"name": "", "arguments": ""},
+                                    }
+                                buf = tool_call_buffers[idx]
+                                fn = tc_delta.get("function") or {}
+                                if fn.get("name"):
+                                    buf["function"]["name"] += fn["name"]
+                                if fn.get("arguments"):
+                                    buf["function"]["arguments"] += fn["arguments"]
+
+                # Emit accumulated tool_calls if any.
+                if tool_call_buffers:
+                    tool_calls = [
+                        tool_call_buffers[k]
+                        for k in sorted(tool_call_buffers.keys())
+                    ]
+                    yield {"tool_calls": tool_calls, "finish_reason": finish_reason, "usage": usage}
+                else:
+                    # vLLM sends `finish_reason` on the *last* chunk; emit a
+                    # final bookkeeping item so callers can show token usage.
+                    yield {"finish_reason": finish_reason, "usage": usage}
         except httpx.TimeoutException as exc:
             raise NetworkError(
                 f"Request timed out after {self.timeout:.0f}s. The model may be "

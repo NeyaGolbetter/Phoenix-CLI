@@ -19,6 +19,15 @@ def test_normalize_appends_v1_when_no_path():
     assert normalize_base_url(" http://localhost:11434/ ") == "http://localhost:11434/v1"
 
 
+def test_normalize_auto_prepends_http_when_no_scheme():
+    """URLs without a scheme should get http:// prepended automatically."""
+    assert normalize_base_url("localhost:11434") == "http://localhost:11434/v1"
+    assert normalize_base_url("myserver.example.com:8080") == "http://myserver.example.com:8080/v1"
+    assert normalize_base_url("custom-host.local") == "http://custom-host.local/v1"
+    assert normalize_base_url("192.168.1.100:5000") == "http://192.168.1.100:5000/v1"
+    assert normalize_base_url("myserver.example.com:8080/api") == "http://myserver.example.com:8080/api"
+
+
 def test_normalize_keeps_explicit_paths():
     assert normalize_base_url("http://localhost:11434/v1") == "http://localhost:11434/v1"
     assert (
