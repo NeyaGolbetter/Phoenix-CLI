@@ -133,9 +133,23 @@ def test_missing_base_url_rejected():
         _collect({"base_url": "", "api_key": "", "model_name": "x"})
 
 
-def test_bad_scheme_rejected():
+def test_url_with_spaces_rejected():
     with pytest.raises(ConfigurationError):
-        _collect({"base_url": "localhost:11434", "api_key": "", "model_name": "x"})
+        _collect({"base_url": "http://bad url", "api_key": "", "model_name": "x"})
+
+
+def test_url_without_scheme_is_accepted():
+    """URLs without an explicit scheme should be normalized (http:// added)."""
+    # We just verify it doesn't raise a ConfigurationError for missing scheme.
+    # The actual connection will fail, but that's a NetworkError, not a config error.
+    import socket
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    with pytest.raises(NetworkError):
+        _collect({"base_url": f"127.0.0.1:{port}", "api_key": "", "model_name": "x"})
 
 
 # ---------------------------------------------------------------------------

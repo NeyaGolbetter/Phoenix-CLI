@@ -1,100 +1,99 @@
 # 🔥 Phoenix CLI
 
-> **A provider-agnostic AI assistant for the terminal — built to run beautifully in Termux.**
+**AI that rises with you.** A provider-agnostic AI assistant for the terminal —
+built to run beautifully on Termux, desktop Linux, macOS, and WSL.
 
-Phoenix CLI is a lightweight, streaming chat client that talks the
-**OpenAI-compatible API** format. Plug in *any* provider — **Ollama, LM Studio,
-vLLM, llama.cpp, OpenRouter, Together AI, Groq, DeepSeek, Mistral, Fireworks,
-xAI, LocalAI** — configure it once, and chat from anywhere, including your
-Android phone.
+Phoenix CLI talks the **OpenAI-compatible API** format. Plug in *any* provider —
+**Ollama, LM Studio, vLLM, llama.cpp, OpenRouter, Together AI, Groq, DeepSeek,
+Mistral, Fireworks, xAI, LocalAI** — configure it once, and chat from anywhere,
+including your Android phone. Supports **MCP (Model Context Protocol)** so your
+AI can use tools like the **Roblox MCP server** to build games from the terminal.
 
 ```
 $ phoenix "write a python script that prints prime numbers"
-$ phoenix chat          # interactive conversation with history
-$ phoenix setup         # configure provider
-$ phoenix models        # list the provider's available models
-$ phoenix status        # check configuration
+$ phoenix chat                     # interactive chat with 30 slash commands
+$ phoenix setup                    # configure provider + model (interactive picker)
+$ phoenix models --select          # pick a model from a numbered list
+$ phoenix mcp add                  # connect a Roblox MCP server
+$ phoenix status                   # check configuration
 ```
 
 ---
 
-## Features
+## 📑 Table of contents
 
-- **Custom provider support** — nothing is hardcoded. Any server that speaks
-  the OpenAI Chat Completions protocol works: local (Ollama/LM Studio/vLLM)
-  or cloud (OpenRouter/Together/Groq/…). You only set `BASE_URL`, `API_KEY`
-  and `MODEL_NAME`.
-- **Configuration management** — `phoenix setup` writes
-  `~/.phoenix_config.json` (mode `0600`). Environment variables
-  (`PHOENIX_BASE_URL`, `PHOENIX_API_KEY`, `PHOENIX_MODEL`) override the file,
-  so secrets never have to touch disk.
-- **Two interaction modes**
-  - Single prompt: `phoenix "your question"`
-  - Interactive chat: `phoenix chat` (conversation history kept in memory,
-    auto-trimmed, with `/clear`, `/model`, `/save` and friends).
-- **Model discovery** — `phoenix models` lists every model the configured
-  provider advertises (Ollama, vLLM, OpenRouter, Groq, …), marking your
-  current model; `--raw` prints bare IDs for scripting.
-- **Token-by-token streaming** — replies render as they arrive, with a
-  spinner while waiting for the first token.
-- **Beautiful terminal UI via `rich`** — markdown rendering, syntax
-  highlighting for code blocks (monokai), tables, panels, and colored output.
-- **Termux-aware** — pure-Python dependency stack (no required C compilation,
-  no GUI libraries), automatic handling of terminal resizes, graceful Ctrl+C
-  that cancels the *request* instead of killing the app, and clean behavior
-  when stdout is piped.
-- **Precise error handling** — network failures, invalid API keys, unknown
-  models, rate limits and wrong endpoints each produce a clear, actionable
-  message (see [Error handling](#error-handling)).
+1. [Installation](#1-installation)
+2. [Initial setup (the 3-step tutorial)](#2-initial-setup)
+3. [Using models — the interactive picker](#3-using-models--the-interactive-picker)
+4. [MCP setup — Roblox MCP on mobile](#4-mcp-setup--roblox-mcp-on-mobile)
+5. [All 30 chat commands](#5-all-30-chat-commands)
+6. [Single-prompt mode](#6-single-prompt-mode)
+7. [Provider cheat sheet](#7-provider-cheat-sheet)
+8. [Termux tips & troubleshooting](#8-termux-tips--troubleshooting)
+9. [Project layout & development](#9-project-layout--development)
 
 ---
 
-## 1. Termux setup
+## 1. Installation
 
-Open Termux (from F-Droid) and run:
+### Termux (Android)
+
+Open Termux (get it from F-Droid, not Play Store) and run:
 
 ```bash
 # 1. Update packages
 pkg update && pkg upgrade
 
-# 2. Install Python and git (Python 3.12 is fine; 3.9+ required)
+# 2. Install Python and git
 pkg install python git
 
-# 3. Get Phoenix CLI
+# 3. Clone Phoenix CLI
 git clone https://github.com/NeyaGolbetter/Phoenix-CLI
 cd Phoenix-CLI
 
-# 4. Install it (+ optional niceties, see below)
+# 4. Install (pure Python — no compiler needed)
 pip install .
-pip install ".[repl,highlight]"     # optional: line editing + syntax colors
+
+# 5. (Optional) line editing + syntax highlighting
+pip install ".[repl,highlight]"
 ```
 
-That's it. `phoenix` is now on your `$PATH` (`$PREFIX/bin`). If the shell
-doesn't find it, start a new session or run `hash -r`, or use the fallback
-`python -m phoenix_cli`.
+`phoenix` is now on your `$PATH` (`$PREFIX/bin`). If the shell doesn't see it,
+run `hash -r` or use the fallback `python -m phoenix_cli`.
 
-> **Optional extras** (both pure Python — no compiler needed):
-> `[repl]` = `prompt_toolkit` → command history, cursor keys and line editing
-> in `phoenix chat`; `[highlight]` = `pygments` → full syntax highlighting in
-> markdown code blocks. Without them, chat falls back to plain `input()` and
-> code blocks render unhighlighted — everything else still works.
+### Desktop (Linux / macOS / WSL)
 
-**Desktop (Linux/macOS/Windows WSL)?** Same steps, just skip the `pkg`
-commands.
+Same steps, skip the `pkg` commands. Requires Python 3.9+.
+
+```bash
+git clone https://github.com/NeyaGolbetter/Phoenix-CLI
+cd Phoenix-CLI
+python3 -m venv .venv && source .venv/bin/activate
+pip install ".[repl,highlight]"
+```
+
+### Optional extras (both pure Python — no compiler)
+
+| Extra        | Package          | What it gives you                                   |
+|-------------|------------------|-----------------------------------------------------|
+| `repl`      | `prompt_toolkit` | cursor keys, history, proper line editing in chat   |
+| `highlight` | `pygments`       | full syntax highlighting in markdown code blocks    |
+
+Without them, chat still works (falls back to plain `input()`), and code blocks
+render unhighlighted.
 
 ---
 
-## 2. Configuration
+## 2. Initial setup
 
-### `phoenix setup`
-
-Interactive, asks three questions (hidden input for the key):
+Run `phoenix setup`. It asks three questions (the API key is hidden):
 
 ```
 $ phoenix setup
 
-   ██████╗ ██╗  ██╗ ██████╗ ███████╗███╗   ██╗██╗██╗  ██╗
-   ...
+Phoenix setup — the provider can be any OpenAI-compatible API.
+Press Enter to keep the current value.
+
 examples:
   Ollama (local)     http://localhost:11434
   LM Studio (local)  http://localhost:1234
@@ -102,77 +101,332 @@ examples:
   OpenRouter         https://openrouter.ai/api
   Together AI        https://api.together.xyz
   Groq               https://api.groq.com/openai
-BASE_URL: http://localhost:11434
-API_KEY (Enter for none — local servers usually need none):
-MODEL_NAME: llama3.2
+  Any custom server    myserver.example.com:8080
+BASE_URL: myserver.example.com:8080
+API_KEY (Enter for none — local servers usually need none): sk-...
 
-╭─ Saved ──────────────────────────────╮
-│  BASE_URL   http://localhost:11434/v1│
-│  API_KEY    (none)                   │
-│  MODEL_NAME llama3.2                 │
-╰──────────────────────────────────────╯
-Config written to /data/data/com.termux/files/home/.phoenix_config.json
+Connecting to the provider to fetch models...
+✓ found 42 model(s)
+
+Select a model (enter its number):
+ #     Model
+ 1     llama3.2
+ 2     qwen2.5-coder
+ 3     gpt-4o-mini  ✓
+ 4     deepseek-coder-v2
+ ...
+Enter number (0 to skip): 3
+✓ selected: gpt-4o-mini
+
+Enable MCP (Model Context Protocol) tools? (for Roblox MCP etc.) [y/N]: n
+
+╭─ Saved ──────────────────────────────────────╮
+│  BASE_URL     http://myserver.example.com:8080/v1  │
+│  API_KEY      sk-****mini                          │
+│  MODEL_NAME   gpt-4o-mini                          │
+│  MCP          disabled                             │
+╰──────────────────────────────────────────────────╯
+
+Next: try phoenix "hello!" or start a conversation with phoenix chat
 ```
 
-The config is a plain JSON file:
+### What happens under the hood
 
-```json
-{
-  "base_url": "http://localhost:11434/v1",
-  "api_key": "",
-  "model_name": "llama3.2"
-}
+1. **BASE_URL** — the endpoint of your provider. If you type a bare hostname
+   (`myserver.example.com:8080`) it gets `http://` prepended automatically.
+   If it has no path, `/v1` is appended (`http://localhost:11434` →
+   `http://localhost:11434/v1`). Explicit paths like
+   `https://api.groq.com/openai` are kept as-is.
+
+2. **API_KEY** — required for cloud providers, usually empty for local servers.
+   Stored in `~/.phoenix_config.json` with file permissions `0600` (owner-only).
+
+3. **MODEL_NAME** — Phoenix connects to your provider and fetches every model
+   it advertises. You pick one from a numbered list. If the auto-fetch fails
+   (no network, provider doesn't expose `/v1/models`), you can type the name
+   manually.
+
+4. **MCP toggle** — enables tool-use. When ON, Phoenix loads `~/.phoenix_mcp.json`
+   (where your MCP servers are defined) and the AI can call tools during chat.
+
+### Environment variables (alternative to the file)
+
+```bash
+export PHOENIX_BASE_URL="http://192.168.1.20:11434"   # e.g. Ollama on your PC
+export PHOENIX_API_KEY="sk-..."
+export PHOENIX_MODEL="llama3.2"
 ```
 
-Notes:
-
-- If `BASE_URL` has **no path**, `/v1` is appended automatically
-  (`http://localhost:11434` → `http://localhost:11434/v1`). Explicit paths
-  are kept as-is, so provider endpoints like `https://api.groq.com/openai`
-  or `https://openrouter.ai/api` work unchanged.
-- Environment variables take priority over the file:
-
-  ```bash
-  export PHOENIX_BASE_URL="http://192.168.1.20:11434"   # e.g. Ollama on your PC
-  export PHOENIX_API_KEY="sk-..."
-  export PHOENIX_MODEL="llama3.2"
-  ```
-
-- `PHOENIX_CONFIG=/path/to/file.json` points at an alternative config file
-  (handy for multiple provider profiles).
-
-### Provider cheat sheet
-
-| Provider                | BASE_URL                     | API key needed? |
-|-------------------------|------------------------------|-----------------|
-| Ollama (local)          | `http://localhost:11434`     | no              |
-| LM Studio (local)       | `http://localhost:1234`      | no              |
-| vLLM (local)            | `http://localhost:8000`      | depends         |
-| llama.cpp server        | `http://localhost:8080`      | depends         |
-| LocalAI                 | `http://localhost:8080`      | no              |
-| OpenRouter              | `https://openrouter.ai/api`  | yes             |
-| Together AI             | `https://api.together.xyz`   | yes             |
-| Groq                    | `https://api.groq.com/openai`| yes             |
-| DeepSeek                | `https://api.deepseek.com`   | yes             |
-| Mistral                 | `https://api.mistral.ai`     | yes             |
-| Fireworks               | `https://api.fireworks.ai/inference` | yes      |
-| xAI (Grok)              | `https://api.x.ai`           | yes             |
-| OpenAI                  | `https://api.openai.com`     | yes             |
+Env vars take priority over the file. `PHOENIX_CONFIG=/path/to/file.json`
+points at an alternative config file (handy for multiple provider profiles).
 
 ---
 
-## 3. Usage
+## 3. Using models — the interactive picker
 
-### Single prompt mode
+Phoenix gives you three ways to pick a model:
+
+### Method 1 — `phoenix models --select` (quick pick)
+
+```bash
+$ phoenix models --select
+
+3 model(s) available from http://localhost:11434/v1
+
+ #     Model
+ 1     llama3.2  ✓
+ 2     qwen2.5-coder
+ 3     gpt-4o-mini
+
+Enter number (0 to skip): 2
+✓ MODEL_NAME saved as 'qwen2.5-coder'
+```
+
+### Method 2 — Inside chat: `/model`
+
+Start any chat session and type `/model`:
+
+```
+phoenix ❯ /model
+Fetching models...
+
+ #     Model
+ 1     llama3.2  ✓
+ 2     qwen2.5-coder
+ 3     gpt-4o-mini
+
+Enter number (0 to skip): 2
+✓ switched to: qwen2.5-coder
+```
+
+Or skip the picker and switch directly:
+
+```
+phoenix ❯ /model llama3.2
+✓ model switched to llama3.2
+```
+
+### Method 3 — `phoenix -m NAME "prompt"` (one-shot override)
+
+```bash
+phoenix -m gpt-4o -t 0.2 "Summarize this: $(cat notes.txt)"
+```
+
+This doesn't change your saved default — just this one request.
+
+### Checking your current model
+
+```bash
+phoenix status
+phoenix models          # current model is marked with ✓
+```
+
+---
+
+## 4. MCP setup — Roblox MCP on mobile
+
+**MCP (Model Context Protocol)** lets your AI call real tools — create Roblox
+parts, edit scripts, query the workspace, etc. — directly from the chat.
+
+### Step 1 — Enable MCP in your config
+
+```bash
+phoenix setup
+# Answer "y" to: Enable MCP (Model Context Protocol) tools?
+```
+
+Or toggle it later:
+
+```bash
+# Just edit ~/.phoenix_config.json and set "mcp_enabled": true
+```
+
+### Step 2 — Install Node.js (Termux)
+
+Most Roblox MCP servers run on Node.js.
+
+```bash
+pkg install nodejs
+```
+
+### Step 3 — Add your Roblox MCP server
+
+```bash
+$ phoenix mcp add
+
+Add MCP server
+Types:
+  stdio  — local command (e.g. npx, python, node)
+  sse    — remote server URL
+
+Transport type [stdio]: stdio
+Server name: roblox
+Command: npx -y @anthropic/mcp-server-roblox
+Environment variables: ROBLOX_API_KEY=your-key-here
+
+✓ MCP server 'roblox' added
+Saved to /data/data/com.termux/files/home/.phoenix_mcp.json
+Enable MCP in your config? (needed to use tools) [Y/n]: Y
+✓ MCP enabled
+```
+
+That creates `~/.phoenix_mcp.json`:
+
+```json
+{
+  "servers": [
+    {
+      "name": "roblox",
+      "command": ["npx", "-y", "@anthropic/mcp-server-roblox"],
+      "env": { "ROBLOX_API_KEY": "your-key-here" }
+    }
+  ]
+}
+```
+
+### Step 4 — Test the connection
+
+```bash
+$ phoenix mcp test
+
+Testing roblox... ✓ connected — 12 tool(s)
+    🔧 create_part — Create a new part in the workspace
+    🔧 edit_script — Edit a script attached to a part
+    🔧 get_hierarchy — List the workspace hierarchy
+    🔧 set_property — Set a property on an instance
+    ... and 8 more
+```
+
+### Step 5 — Chat with MCP tools enabled
+
+```bash
+$ phoenix chat
+
+Model: gpt-4o-mini
+API:   http://myserver.example.com:8080/v1
+MCP:   12 tool(s) from 1 server(s)
+
+phoenix ❯ create a red 4x4x1 brick called "Floor" in the workspace
+  🔧 Calling mcp__roblox__create_part...
+  ✓ Part "Floor" created at (0, 0, 0) with size (4, 4, 1), color red.
+```
+
+The AI calls the MCP tool **automatically** — no permission prompts. Toggle
+this behavior in chat with `/auto on` (default) or `/auto off` (ask first).
+
+### Managing MCP servers
+
+```bash
+phoenix mcp list            # see all configured servers
+phoenix mcp test            # test every server
+phoenix mcp test roblox     # test one server
+phoenix mcp remove roblox   # remove a server
+phoenix mcp add             # add another (supports SSE remote servers too)
+```
+
+### Adding a remote (SSE) MCP server
+
+```bash
+$ phoenix mcp add
+
+Transport type [stdio]: sse
+Server name: remote-tools
+Server URL: https://my-mcp-server.example.com
+API key for MCP server: sk-...
+
+✓ MCP server 'remote-tools' added
+```
+
+---
+
+## 5. All 30 chat commands
+
+Start a chat session with `phoenix chat`, then use these commands. Every
+command starts with `/`. Type `/help` at any time to see them all.
+
+| # | Command | What it does |
+|---|---------|-------------|
+| 1 | `/help` | Show this complete command reference inside chat |
+| 2 | `/exit`, `/quit`, `/q` | Leave the chat session (Ctrl+D also works) |
+| 3 | `/clear` | Forget the conversation history (system prompt stays) |
+| 4 | `/model` | **Interactive model picker** — fetches models and lets you choose by number |
+| 5 | `/model NAME` | Switch directly to model `NAME` for this session |
+| 6 | `/system` | Show the current system prompt |
+| 7 | `/system TEXT` | Set a new system prompt (empty text clears it) |
+| 8 | `/temp` | Show current sampling temperature |
+| 9 | `/temp N` | Set temperature to `N` (e.g. `/temp 0.2` for focused, `/temp 0.9` for creative) |
+| 10 | `/max-tokens` | Show current max-token cap |
+| 11 | `/max-tokens N` | Cap reply length to `N` tokens |
+| 12 | `/history` | Show how many messages are in memory and the trim limit |
+| 13 | `/save` | Save the conversation to `phoenix_chat.md` |
+| 14 | `/save FILE.md` | Save to a specific file (supports `/sdcard/...` paths) |
+| 15 | `/tools` | List all MCP tools currently connected |
+| 16 | `/mcp` | Show MCP server status, connected tools count, and auto-approve state |
+| 17 | `/auto` | Show whether tool calls are auto-approved (default: ON) |
+| 18 | `/auto on` | **Auto-approve tool calls** — the AI runs tools immediately, no prompts (default) |
+| 19 | `/auto off` | Ask for confirmation before each tool call — review args before execution |
+| 20 | `/status` | Show your current session config (model, URL, API key, MCP) |
+| 21 | `/ping` | Send a tiny request to measure latency to your provider |
+| 22 | `/models` | List the provider's available models inline (with numbered picker) |
+| 23 | `/copy` | Copy the last AI reply to clipboard (Termux:API) or print it plain |
+| 24 | `/undo` | Remove the last user+assistant exchange from history |
+| 25 | `/retry` | Remove the last AI reply and resend your last message |
+| 26 | `/export` | Export the full conversation as JSON to `phoenix_chat.json` |
+| 27 | `/export FILE.json` | Export to a specific file |
+| 28 | `/import FILE.json` | Import a conversation from a previously exported JSON file |
+| 29 | `/theme NAME` | Switch code-block theme (`monokai`, `github_dark`, `dracula`, `vs_dark`) |
+| 30 | `/verbose` | Toggle verbose mode (shows raw token chunks and tool payloads) |
+| 31 | `/context` | Show current token count and estimated context window usage |
+| 32 | `/reset` | Full reset — clear history, restore defaults, reload config |
+| 33 | `/search WORD` | Search your conversation history (case-insensitive) and show matches |
+| 34 | `/pin TEXT` | Pin a persistent note into the system prompt (survives /clear) |
+| 35 | `/pinned` | List all pinned notes with numbers |
+| 36 | `/unpin N` | Remove pinned note #N |
+| 37 | `/compact` | Ask the AI to summarize the conversation into a compressed form (saves context) |
+| 38 | `/config` | Show and interactively edit BASE_URL, API_KEY, MODEL_NAME |
+
+### Key commands explained
+
+**`/model`** — The interactive model picker. When you type `/model` with no
+argument, Phoenix fetches all available models from your provider and shows a
+numbered list. Type the number to switch. This is the easiest way to try
+different models without leaving the chat.
+
+**`/auto on` / `/auto off`** — Controls tool-call permission. When **ON**
+(default), the AI calls MCP tools immediately — it can build Roblox games,
+run code, query APIs, all without asking. When **OFF**, every tool call gets a
+confirmation prompt so you can review the arguments first.
+
+**`/pin TEXT`** — Pinned notes get added to the system prompt and survive
+`/clear`. Great for rules like "always respond in Python" or "we're building a
+Roblox obby game".
+
+**`/compact`** — When conversations get long, use `/compact` to ask the AI to
+summarize everything so far into a short message. The history gets replaced
+with the summary, freeing up context window for new content.
+
+**`/search WORD`** — Finds every message in your history containing `WORD`.
+Shows the message number, role, and a snippet.
+
+**`/copy`** — Copies the last assistant reply. On Termux, uses `termux-clipboard-set`.
+On other systems, prints the reply in plain text (no ANSI codes) so you can
+copy manually.
+
+---
+
+## 6. Single-prompt mode
+
+For scripts, pipes, and quick questions:
 
 ```bash
 phoenix "Write a python script that prints prime numbers up to 100"
 phoenix "Explain git rebase in two sentences" --model llama3.2
 phoenix -m gpt-4o -t 0.2 "Summarize this: $(cat notes.txt)"
 phoenix --system "You are a terse Linux expert" "how do I mount an ext4 image?"
+phoenix --no-stream "generate a JSON config for nginx" > nginx_idea.json
 ```
 
-Options (work before or after the prompt):
+Options:
 
 | Option            | Meaning                                        |
 |-------------------|------------------------------------------------|
@@ -182,104 +436,37 @@ Options (work before or after the prompt):
 | `--max-tokens N`  | cap the reply length                           |
 | `--no-stream`     | print only the finished reply (nice for scripts/pipes) |
 
-Piping works cleanly — decorations are skipped and no ANSI codes leak:
+---
 
-```bash
-phoenix --no-stream "generate a JSON config for nginx" > nginx_idea.json
-```
+## 7. Provider cheat sheet
 
-### Interactive chat mode
+| Provider                | BASE_URL                              | API key needed? |
+|-------------------------|---------------------------------------|-----------------|
+| Ollama (local)          | `http://localhost:11434`              | no              |
+| LM Studio (local)       | `http://localhost:1234`               | no              |
+| vLLM (local)            | `http://localhost:8000`               | depends         |
+| llama.cpp server        | `http://localhost:8080`               | depends         |
+| LocalAI                 | `http://localhost:8080`               | no              |
+| OpenRouter              | `https://openrouter.ai/api`           | yes             |
+| Together AI             | `https://api.together.xyz`            | yes             |
+| Groq                    | `https://api.groq.com/openai`         | yes             |
+| DeepSeek                | `https://api.deepseek.com`            | yes             |
+| Mistral                 | `https://api.mistral.ai`              | yes             |
+| Fireworks               | `https://api.fireworks.ai/inference`  | yes             |
+| xAI (Grok)              | `https://api.x.ai`                    | yes             |
+| OpenAI                  | `https://api.openai.com`              | yes             |
+| **Any custom server**   | `yourserver.example.com:port`         | depends         |
 
-```bash
-phoenix chat
-phoenix chat --model llama3.2 --system "You are my coding buddy"
-```
-
-```
-Model: llama3.2
-API:   http://localhost:11434/v1
-Type /help for commands • Ctrl+C cancels a reply
-
-phoenix ❯ what's a decorator in python?
-Phoenix answers, streaming token by token...
-
-phoenix ❯ /model qwen2.5-coder
-✔ model switched to qwen2.5-coder
-```
-
-In-chat commands:
-
-| Command            | Effect                                              |
-|--------------------|-----------------------------------------------------|
-| `/help`            | show all commands                                   |
-| `/exit`, `/quit`   | leave the chat (Ctrl+D also works)                  |
-| `/clear`           | forget conversation history                         |
-| `/model NAME`      | switch model for this session                       |
-| `/system TEXT`     | set/replace the system prompt (empty clears it)     |
-| `/temp 0.8`        | set sampling temperature                            |
-| `/max-tokens 1024` | cap reply length                                    |
-| `/history`         | show how many messages are in memory                |
-| `/save FILE`       | export the conversation as markdown                 |
-
-History lives in memory (never on disk) and is automatically trimmed past 60
-messages — oldest first, always keeping the system prompt and your latest
-question — so long chats stay flat on a phone. Note that `phoenix
-"prompt"` where the first word equals a command name (e.g. `phoenix
-"status report"`) is treated as a command; use `phoenix ask "status report"`
-for those cases.
-
-### Other commands
-
-```bash
-phoenix models            # list the provider's available models (current one marked)
-phoenix models --raw      # one model ID per line — pipe it into scripts
-phoenix status            # show config, where it comes from, masked key
-phoenix status --probe    # + send a real test request and measure latency
-phoenix --version
-phoenix --help
-```
-
-Not every provider implements the `GET /v1/models` listing endpoint — if
-yours doesn't, Phoenix CLI says so and points you at the alternative (e.g.
-`ollama list` for local Ollama).
+> **Tip:** You can type **any** base URL — Phoenix accepts bare hostnames,
+> IPs with ports, custom subdomains, whatever. It will auto-add `http://` if
+> you omit the scheme and `/v1` if there's no path.
 
 ---
 
-## 4. Error handling
-
-Every failure is caught and translated into a one-line diagnosis plus a hint.
-Nothing crashes with a raw traceback.
-
-| Error class             | When                                                              | Fix |
-|-------------------------|-------------------------------------------------------------------|-----|
-| `ConfigurationError`    | `BASE_URL` / `MODEL_NAME` missing or malformed                    | run `phoenix setup` |
-| `APIKeyError`           | provider rejected the key (HTTP 401/403)                          | `phoenix setup` → new key |
-| `ModelNotFoundError`    | model name unknown (HTTP 404, or a 400 mentioning the model)      | check the exact name (`ollama list`) |
-| `RateLimitError`        | HTTP 429                                                          | wait, retry later |
-| `NetworkError`          | DNS/refused/timeout/TLS — server unreachable                      | `phoenix status --probe`, check the URL |
-| `ProviderError`         | HTTP 5xx or non-API answer (e.g. an HTML page → missing `/v1`)    | shown in the message |
-
-```bash
-$ phoenix "hi"
-✖ APIKeyError
-Authentication failed (HTTP 401). Your API key was rejected.
-Run `phoenix setup` to update it.
-```
-
-**Ctrl+C behavior (Termux included):**
-
-- mid-reply (single prompt or chat) → cancels the request, keeps the app alive,
-  exit code `130` for the one-shot command;
-- at the chat prompt → shows a hint instead of quitting (`/exit` or Ctrl+D);
-- history stays consistent: a cancelled prompt is removed again, so the model
-  never sees a question it didn't answer.
-
----
-
-## 5. Termux tips & troubleshooting
+## 8. Termux tips & troubleshooting
 
 - **Ctrl key**: Termux puts `CTRL` on the extra-keys row above the keyboard
-  (swipe it if hidden), or use the volume-down button binding
+  (swipe it if hidden), or use volume-down button binding
   (*Termux: Settings → Volume keys*). Ctrl+C = cancel reply, Ctrl+D = exit chat.
 - **Local servers on the same device**: if the model server runs *inside*
   Termux (`pkg install ollama`), bind it to `127.0.0.1` and use
@@ -295,25 +482,29 @@ Run `phoenix setup` to update it.
   alive during long generations.
 - **Terminal resizing**: rich re-measures the terminal on every render, so
   rotating the phone or splitting the pane reflows the output automatically.
-- **Installing extras fails to compile**: `[repl]` and `[highlight]` are pure
-  Python, so they should never need a compiler. If any dependency ever does,
-  `pkg install rust binutils` is the Termux fix — but you don't need it here.
 - **Saving chats to shared storage**: `/save /sdcard/Documents/chat.md` needs
   `termux-setup-storage` first (one-time).
+- **Installing extras fails to compile**: `[repl]` and `[highlight]` are pure
+  Python, so they should never need a compiler.
 - **Battery**: streaming is plain HTTPS; disable battery optimization for
   Termux only if you run long unattended generations.
+- **Roblox MCP**: the server runs as a child process inside Termux. Make sure
+  Node.js (`pkg install nodejs`) and the MCP package are installed. Check
+  with `phoenix mcp test` before chatting.
 
 ---
 
-## 6. Project layout
+## 9. Project layout & development
 
 ```
 phoenix_cli/
 ├── __init__.py    version
-├── cli.py         click commands, chat loop, streaming UI (rich.Live)
-├── client.py      httpx streaming client, error taxonomy, conversation
-└── config.py      ~/.phoenix_config.json handling, env-var overrides
-tests/             pytest suite + a mock OpenAI-compatible server
+── cli.py         click commands, chat loop, 30 slash commands, streaming UI
+├── client.py      httpx streaming client, error taxonomy, tool-use support
+├── config.py      ~/.phoenix_config.json handling, env-var overrides
+└── mcp.py         MCP client (stdio + SSE), manager, tool definitions
+tests/             pytest suite + a live mock OpenAI server + pty tests
+assets/            logo and media for the README
 pyproject.toml     packaging, `phoenix` entry point, extras
 ```
 
@@ -321,14 +512,14 @@ Tech stack: **Python 3.9+**, **httpx** (async streaming), **rich**
 (terminal UI/markdown), **click** (CLI parsing) — with optional
 **prompt_toolkit** and **pygments** extras.
 
-## 7. Development
+### Development setup
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,repl,highlight]"
-pytest            # 42 tests, incl. a live mock OpenAI server + pty tests
+pytest                    # 60+ tests, incl. mock server + pty tests
 ```
 
-## License
+### License
 
 MIT

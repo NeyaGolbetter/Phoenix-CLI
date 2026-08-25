@@ -81,8 +81,9 @@ def test_unknown_first_token_routes_to_prompt(clean_env):
 
 def test_setup_writes_config(clean_env):
     runner = CliRunner()
+    # URL, API_KEY (empty), model (auto-fetch fails so manual entry), MCP (no)
     result = runner.invoke(
-        cli, ["setup"], input="http://localhost:11434\n\nllama3.2\n"
+        cli, ["setup"], input="http://localhost:11434\n\nllama3.2\nn\n"
     )
     assert result.exit_code == 0, result.output
     cfg = json.loads(clean_env.read_text(encoding="utf-8"))
@@ -93,7 +94,8 @@ def test_setup_writes_config(clean_env):
 
 def test_setup_rejects_garbage_url(clean_env):
     runner = CliRunner()
-    result = runner.invoke(cli, ["setup"], input="not a url\nhttp://localhost:11434\n\nllama3\n")
+    # bad URL, good URL, API_KEY (empty), model (manual), MCP (no)
+    result = runner.invoke(cli, ["setup"], input="not a url\nhttp://localhost:11434\n\nllama3\nn\n")
     assert result.exit_code == 0
     assert "valid URL" in result.output  # it warned about the bad one
 
@@ -214,3 +216,91 @@ def test_no_stream_flag_prints_complete_reply(tmp_path, mock_api):
     result = run_phoenix(["--no-stream", "hi"], env)
     assert result.returncode == 0, result.stderr
     assert "mock provider" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Model selection (interactive --select)
+# ---------------------------------------------------------------------------
+
+
+def test_models_select_interactive(mock_api, clean_env):
+    """`phoenix models --select` lets you pick a model from a numbered list."""
+    save_config(mock_api, "", "ok")
+    runner = CliRunner()
+    # The mock server has models: echo, ok, qwen2.5-coder (sorted).
+    # Select the first one (number 1).
+    result = runner.invoke(cli, ["models", "--select"], input="1\n")
+    assert result.exit_code == 0, result.output
+    assert "selected" in result.output.lower()
+    assert "saved" in result.output.lower()
+
+
+def test_models_select_cancel(mock_api, clean_env):
+    """Entering 0 skips the selection."""
+    save_config(mock_api, "", "ok")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["models", "--select"], input="0\n")
+    assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# MCP commands
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_list_empty(clean_env, monkeypatch, tmp_path):
+    """`phoenix mcp list` shows a helpful message when no servers configured."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    save_config("http://localhost:11434", "", "llama3", mcp_enabled=True)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mcp", "list"])
+    assert result.exit_code == 0, result.output
+    assert "No MCP servers" in result.output
+
+
+def test_mcp_list_with_servers(clean_env, monkeypatch, tmp_path):
+    """`phoenix mcp list` shows configured servers."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    save_config("http://localhost:11434", "", "llama3", mcp_enabled=True)
+    # Write an MCP config.
+    from phoenix_cli.mcp import save_mcp_config
+    save_mcp_config([
+        {"name": "roblox", "command": ["npx", "-y", "roblox-mcp"]},
+        {"name": "remote", "url": "https://mcp.example.com"},
+    ])
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mcp", "list"])
+    assert result.exit_code == 0, result.output
+    assert "roblox" in result.output
+    assert "remote" in result.output
+    assert "stdio" in result.output
+    assert "sse" in result.output
+
+
+def test_mcp_remove(clean_env, monkeypatch, tmp_path):
+    """`phoenix mcp remove` removes a server by name."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    save_config("http://localhost:11434", "", "llama3", mcp_enabled=True)
+    from phoenix_cli.mcp import save_mcp_config, load_mcp_config
+    save_mcp_config([
+        {"name": "roblox", "command": ["npx", "-y", "roblox-mcp"]},
+        {"name": "other", "command": ["node", "server.js"]},
+    ])
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mcp", "remove", "roblox"])
+    assert result.exit_code == 0, result.output
+    assert "removed" in result.output.lower()
+    remaining = load_mcp_config()
+    assert len(remaining) == 1
+    assert remaining[0]["name"] == "other"
+
+
+def test_status_shows_mcp(clean_env, monkeypatch, tmp_path):
+    """`phoenix status` shows MCP status."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    save_config("http://localhost:11434", "", "llama3", mcp_enabled=True)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["status"])
+    assert result.exit_code == 0, result.output
+    assert "MCP" in result.output
+    assert "enabled" in result.output
