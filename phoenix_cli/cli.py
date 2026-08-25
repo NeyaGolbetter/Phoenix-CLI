@@ -31,7 +31,6 @@ import sys
 import termios
 import time
 import tty
-import getpass as _getpass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -339,31 +338,18 @@ def _hidden_input_raw(prompt_text: str) -> str:
 
 
 def _ask_api_key_secure(current: str = "") -> str:
-    """Ask for an API key with a bulletproof input method.
+    """Ask for an API key using visible Rich Prompt.ask — the same method
+    that works reliably for BASE_URL and MODEL_NAME on every terminal
+    including Termux/Android.
 
-    Fixes the long-standing bug where the API key prompt appeared to not accept
-    typing in certain terminals (Termux, some SSH/container environments, IDE
-    integrated terminals, etc.). The root cause was a chain of silent failures:
+    Previous approaches (prompt_toolkit password, Rich password=True,
+    getpass, custom termios with SIGALRM) all broke on Termux because:
+      - prompt_toolkit hangs on CPR queries (ESC[6n) that Termux never answers
+      - getpass/termios block on /dev/tty with bionic libc differences
+      - SIGALRM cannot interrupt a blocked os.read on Android bionic
 
-    1. ``prompt_toolkit.prompt(is_password=True)`` can hang on terminals that
-       don't respond to cursor-position-request (CPR / ``ESC[6n``) queries,
-       because prompt_toolkit starts an Application that waits for terminal
-       handshake. No exception is raised so chained fallbacks never fire.
-    2. ``rich.Prompt.ask(password=True)`` and ``getpass.getpass()`` both use
-       ``getpass.unix_getpass`` which opens ``/dev/tty`` directly and disables
-       ECHO via termios. This works in *most* terminals but fails silently in
-       environments where termios tcsetattr raises (e.g. certain pipes,
-       ``docker exec -t`` wrappers, some multiplexers).
-    3. When hidden input fails or the user doesn't realize typing is hidden
-       (no visual feedback of any kind), they conclude "nothing is happening".
-
-    New strategy:
-      * **Non-TTY** (tests, pipes, CliRunner): plain visible Prompt.ask().
-      * **TTY**: a custom ``_hidden_input_raw`` implementation that opens
-        /dev/tty, uses termios directly (most reliable on POSIX), shows ●
-        bullets as the user types, supports backspace/Ctrl+U, and is wrapped
-        in a short timeout so it can never hang. If even that fails, we fall
-        back to visible Rich input which is guaranteed to work.
+    The fix: just use plain ``Prompt.ask()`` — visible input, no tricks.
+    Users who need echo-free input can set the PHOENIX_API_KEY env var.
     """
     masked = mask_secret(current) if current else "(none)"
     console.print(
@@ -371,9 +357,7 @@ def _ask_api_key_secure(current: str = "") -> str:
             f"[bold]Current:[/bold] {masked}\n"
             f"[dim]• Press Enter to keep the current value\n"
             f"• Leave empty for local servers (Ollama, LM Studio) — no key needed\n"
-            f"• Type or paste your key; [bold]{len('●')*'●'}[/bold] bullets appear as you type\n"
-            f"• Backspace works • Ctrl+U clears • Ctrl+C cancels\n"
-            f"• Stored with 0600 permissions in {config_path()}[/dim]",
+            f"• For hidden input, set the PHOENIX_API_KEY environment variable[/dim]",
             title=f"[bold {ACCENT}]🔑 API Key[/bold {ACCENT}]",
             border_style=ACCENT,
             box=ROUNDED,
@@ -381,68 +365,9 @@ def _ask_api_key_secure(current: str = "") -> str:
         )
     )
 
-    # ---- Non-TTY (tests, CI, CliRunner, pipes) — visible input, guaranteed ----
-    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
-    if not is_tty:
-        try:
-            val = Prompt.ask(
-                f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}] [dim](Enter for none/local)[/dim]",
-                default="",
-                show_default=False,
-                console=console,
-            ).strip()
-            if not val:
-                return current or ""
-            return val
-        except (KeyboardInterrupt, EOFError):
-            raise
-        except Exception:
-            try:
-                val = input("API_KEY (Enter for none): ").strip()
-                if not val:
-                    return current or ""
-                return val
-            except (EOFError, KeyboardInterrupt):
-                return current or ""
-
-    # ---- TTY: primary — custom raw termios with bullet feedback ----
-    # Flush Rich output before switching terminal modes.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    time.sleep(0.05)
-
-    try:
-        console.print(
-            f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}] "
-            f"[dim](hidden — ● appears per char, paste works)[/dim]"
-        )
-        # Use our raw termios reader on /dev/tty — most reliable on POSIX.
-        try:
-            val = _hidden_input_raw("   ").strip()
-        except (KeyboardInterrupt, EOFError):
-            raise
-        except Exception:
-            # Termios approach failed (unlikely on POSIX) — try getpass.
-            val = _getpass.getpass("   ").strip()
-        if not val:
-            return current or ""
-        # Give the user feedback that their key was received.
-        console.print(f"[dim]   ✔ received {len(val)} character(s)[/dim]")
-        return val
-    except (KeyboardInterrupt, EOFError):
-        raise
-    except Exception as exc:
-        console.print(
-            f"[dim]   (hidden input unavailable: {type(exc).__name__})[/dim]"
-        )
-
-    # ---- Final safety net: VISIBLE input (always works) ----
-    console.print(
-        "[yellow]⚠ Using visible input — type your key and press Enter[/yellow]"
-    )
     try:
         val = Prompt.ask(
-            f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}]",
+            f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}] [dim](Enter for none/local)[/dim]",
             default="",
             show_default=False,
             console=console,
@@ -559,58 +484,25 @@ def _ask_model_name_with_ui(current: str) -> str:
 
 
 def _ask_mcp_key_secure() -> str:
-    """Secure prompt for MCP server API keys — same robust approach as API key."""
-    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
-    if not is_tty:
-        try:
-            return Prompt.ask(
-                f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}] [dim](Enter for none)[/dim]",
-                default="",
-                show_default=False,
-                console=console,
-            ).strip()
-        except Exception:
-            try:
-                return input("MCP API_KEY (Enter for none): ").strip()
-            except Exception:
-                return ""
+    """Prompt for an MCP server API key using visible Rich Prompt.ask.
 
-    # Use the bulletproof raw termios hidden input.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    time.sleep(0.05)
-    console.print(
-        f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}] "
-        f"[dim](hidden — ● per char, Enter for none)[/dim]"
-    )
+    Same approach as _ask_api_key_secure — plain visible input that works
+    on every terminal including Termux/Android. No hidden-input tricks.
+    """
     try:
-        try:
-            val = _hidden_input_raw("   ").strip()
-        except (KeyboardInterrupt, EOFError):
-            raise
-        except Exception:
-            val = _getpass.getpass("   ").strip()
-        if val:
-            console.print(f"[dim]   ✔ received {len(val)} character(s)[/dim]")
-        return val
+        return Prompt.ask(
+            f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}] [dim](Enter for none)[/dim]",
+            default="",
+            show_default=False,
+            console=console,
+        ).strip()
     except (KeyboardInterrupt, EOFError):
         return ""
     except Exception:
         try:
-            console.print(
-                "[yellow]⚠ Using visible input — type key and Enter[/yellow]"
-            )
-            return Prompt.ask(
-                f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}]",
-                default="",
-                show_default=False,
-                console=console,
-            ).strip()
+            return input("MCP API_KEY (Enter for none): ").strip()
         except Exception:
-            try:
-                return input("MCP API_KEY (Enter for none): ").strip()
-            except Exception:
-                return ""
+            return ""
 
 
 # ---------------------------------------------------------------------------
