@@ -14,6 +14,9 @@ Scenario selection happens through the *model name* sent in the request:
     fail-server      500
     fail-html        200 with an HTML content-type (wrong endpoint)
     slow             sleeps 1s before the first token
+
+The mock also serves ``GET /v1/models`` (model listing) and answers 401 on
+that endpoint when ``Authorization: Bearer bad-key`` is sent.
 """
 
 from __future__ import annotations
@@ -64,6 +67,28 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     # -- routes -------------------------------------------------------------
+
+    def do_GET(self):  # noqa: N802 (http.server API)
+        if self.path.rstrip("/").endswith("/models"):
+            if self.headers.get("Authorization", "") == "Bearer bad-key":
+                return self._send_json(401, {"error": {"message": "Invalid API key"}})
+            return self._send_json(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": "echo", "object": "model", "created": 1, "owned_by": "mock"},
+                        {"id": "nonstream", "object": "model", "created": 1, "owned_by": "mock"},
+                        {"id": "ok", "object": "model", "created": 1, "owned_by": "mock"},
+                        {"id": "qwen2.5-coder", "object": "model", "created": 1, "owned_by": "mock"},
+                        {"id": "slow", "object": "model", "created": 1, "owned_by": "mock"},
+                        {"id": "usage", "object": "model", "created": 1, "owned_by": "mock"},
+                    ],
+                },
+            )
+
+        # Any other GET: behave like a server that is not an OpenAI API.
+        return self._send_html(200, "<html><body><h1>It works!</h1></body></html>")
 
     def do_POST(self):  # noqa: N802 (http.server API)
         length = int(self.headers.get("Content-Length") or 0)

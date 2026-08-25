@@ -139,6 +139,39 @@ def test_bad_scheme_rejected():
 
 
 # ---------------------------------------------------------------------------
+# Model listing
+# ---------------------------------------------------------------------------
+
+
+def test_list_models_returns_sorted_ids(mock_api):
+    async def run():
+        client = PhoenixClient(base_url=mock_api, api_key="", model_name="ok")
+        try:
+            async with client:
+                return await client.list_models()
+        finally:
+            await client.close()
+
+    ids = asyncio.run(run())
+    assert "echo" in ids
+    assert "qwen2.5-coder" in ids
+    assert ids == sorted(set(ids))
+
+
+def test_list_models_bad_key_raises_api_error(mock_api):
+    async def run():
+        client = PhoenixClient(base_url=mock_api, api_key="bad-key", model_name="ok")
+        try:
+            async with client:
+                return await client.list_models()
+        finally:
+            await client.close()
+
+    with pytest.raises(APIKeyError):
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
 # Conversation trimming
 # ---------------------------------------------------------------------------
 

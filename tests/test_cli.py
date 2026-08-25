@@ -121,6 +121,31 @@ def test_status_probe_reports_auth_error(mock_api, clean_env):
     assert "APIKeyError" in result.output
 
 
+def test_models_command_lists_and_marks_current(mock_api, clean_env):
+    save_config(mock_api, "", "qwen2.5-coder")
+    result = CliRunner().invoke(cli, ["models"])
+    assert result.exit_code == 0, result.output
+    assert "✓ qwen2.5-coder" in result.output  # current model is marked
+    assert "ok" in result.output
+    assert "echo" in result.output
+
+
+def test_models_raw_prints_bare_ids(mock_api, clean_env):
+    save_config(mock_api, "", "ok")
+    result = CliRunner().invoke(cli, ["models", "--raw"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.strip().splitlines()
+    assert "ok" in lines
+    assert "✓" not in result.output  # no decoration in raw mode
+
+
+def test_models_command_end_to_end(tmp_path, mock_api):
+    env = make_env(tmp_path, base_url=mock_api, model="ok")
+    result = run_phoenix(["models", "--raw"], env)
+    assert result.returncode == 0, result.stderr
+    assert "qwen2.5-coder" in result.stdout.splitlines()
+
+
 # ---------------------------------------------------------------------------
 # Full end-to-end via subprocess (real stdio, real HTTP)
 # ---------------------------------------------------------------------------

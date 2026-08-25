@@ -12,6 +12,7 @@ Android phone.
 $ phoenix "write a python script that prints prime numbers"
 $ phoenix chat          # interactive conversation with history
 $ phoenix setup         # configure provider
+$ phoenix models        # list the provider's available models
 $ phoenix status        # check configuration
 ```
 
@@ -31,6 +32,9 @@ $ phoenix status        # check configuration
   - Single prompt: `phoenix "your question"`
   - Interactive chat: `phoenix chat` (conversation history kept in memory,
     auto-trimmed, with `/clear`, `/model`, `/save` and friends).
+- **Model discovery** — `phoenix models` lists every model the configured
+  provider advertises (Ollama, vLLM, OpenRouter, Groq, …), marking your
+  current model; `--raw` prints bare IDs for scripting.
 - **Token-by-token streaming** — replies render as they arrive, with a
   spinner while waiting for the first token.
 - **Beautiful terminal UI via `rich`** — markdown rendering, syntax
@@ -227,11 +231,17 @@ for those cases.
 ### Other commands
 
 ```bash
+phoenix models            # list the provider's available models (current one marked)
+phoenix models --raw      # one model ID per line — pipe it into scripts
 phoenix status            # show config, where it comes from, masked key
 phoenix status --probe    # + send a real test request and measure latency
 phoenix --version
 phoenix --help
 ```
+
+Not every provider implements the `GET /v1/models` listing endpoint — if
+yours doesn't, Phoenix CLI says so and points you at the alternative (e.g.
+`ollama list` for local Ollama).
 
 ---
 

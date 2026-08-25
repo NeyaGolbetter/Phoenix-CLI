@@ -301,6 +301,88 @@ class PhoenixClient:
         except httpx.TransportError as exc:
             raise NetworkError(f"Network error while talking to {self.base_url}: {exc}") from exc
 
+    # -- model listing -------------------------------------------------------
+
+    async def list_models(self) -> List[str]:
+        """Return the model IDs advertised by the provider (GET ``/models``).
+
+        OpenRouter, Groq, Together AI and most self-hosted stacks implement
+        this endpoint; Ollama exposes it through its ``/v1`` compatibility
+        layer. Raises ``ProviderError`` with a hint when the provider does
+        not support model listing.
+        """
+        if self._client is None:
+            raise ProviderError("Client is not open; call `open()` first")
+        try:
+            response = await self._client.get(self._url("models"))
+        except httpx.TimeoutException as exc:
+            raise NetworkError(
+                f"Request timed out after {self.timeout:.0f}s while listing models."
+            ) from exc
+        except httpx.ConnectError as exc:
+            raise NetworkError(
+                f"Could not connect to {self.base_url}.\n"
+                "  * Is the server running (Ollama / LM Studio / vLLM / ...)?\n"
+                "  * Is the BASE_URL correct? Check it with `phoenix status`."
+            ) from exc
+        except httpx.TransportError as exc:
+            raise NetworkError(
+                f"Network error while talking to {self.base_url}: {exc}"
+            ) from exc
+
+        if response.status_code != 200:
+            await self._raise_models_error(response)
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ProviderError(
+                "The models endpoint answered with non-JSON data. Is BASE_URL "
+                "pointing at the provider's OpenAI-compatible endpoint?"
+            ) from exc
+
+        ids: List[str] = []
+        if isinstance(data, dict):
+            for item in data.get("data") or []:
+                if isinstance(item, dict) and item.get("id"):
+                    ids.append(str(item["id"]))
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    ids.append(item)
+                elif isinstance(item, dict) and item.get("id"):
+                    ids.append(str(item["id"]))
+        return sorted(set(ids))
+
+    async def _raise_models_error(self, response: httpx.Response) -> None:
+        """Convert a non-200 ``/models`` response into a precise error."""
+        status = response.status_code
+        detail = self._extract_error_message(response.text[:500])
+        if status in (401, 403):
+            raise APIKeyError(
+                f"Authentication failed (HTTP {status}). Your API key was rejected.\n"
+                "Run `phoenix setup` to update it.\n"
+                f"Provider said: {detail}"
+            )
+        if status == 429:
+            raise RateLimitError(
+                "Rate limited by the provider (HTTP 429). Wait a moment and retry."
+            )
+        if status >= 500:
+            raise ProviderError(
+                f"The provider had a server error (HTTP {status}): {detail}"
+            )
+        if status == 404:
+            raise ProviderError(
+                "This provider does not expose a model list (GET .../models "
+                "answered HTTP 404).\n"
+                "Tips:\n"
+                "  * local Ollama: run `ollama list` in Termux instead\n"
+                "  * cloud providers: check their docs / model dashboard\n"
+                "  * make sure BASE_URL points at the `/v1` endpoint"
+            )
+        raise ProviderError(f"Unexpected response (HTTP {status}): {detail}")
+
     async def _check_media_type(self, response: httpx.Response) -> None:
         """Fail fast with a helpful message when the URL is not an API."""
         ctype = response.headers.get("content-type", "")

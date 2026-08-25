@@ -5,6 +5,7 @@ Commands
 phoenix "prompt"        one-shot prompt (also: phoenix ask "prompt")
 phoenix chat            interactive chat with in-memory history
 phoenix setup           configure BASE_URL / API_KEY / MODEL_NAME
+phoenix models          list the provider's available models
 phoenix status          show the current configuration (+ optional probe)
 
 Design notes for Termux:
@@ -498,6 +499,12 @@ async def _probe(params: Dict[str, Any]) -> bool:
     return True
 
 
+async def _list_models(params: Dict[str, Any]) -> List[str]:
+    """Fetch the provider's model list (errors are printed by the caller)."""
+    async with make_client(params) as client:
+        return await client.list_models()
+
+
 # ---------------------------------------------------------------------------
 # Click command group
 # ---------------------------------------------------------------------------
@@ -566,6 +573,8 @@ def cli(
                 "one-shot prompt\n"
                 "  [bold #ff6b00]phoenix chat[/bold #ff6b00]                     "
                 "interactive conversation\n"
+                "  [bold #ff6b00]phoenix models[/bold #ff6b00]                   "
+                "list the provider's models\n"
                 "  [bold #ff6b00]phoenix status[/bold #ff6b00]                   "
                 "show current configuration\n"
                 "\n"
@@ -694,6 +703,53 @@ def status(probe: bool) -> None:
         params["timeout"] = 15.0  # keep the probe snappy
         if not asyncio.run(_probe(params)):
             raise SystemExit(1)
+
+
+@cli.command()
+@click.option("--raw", is_flag=True, help="Print one model ID per line (for scripts).")
+def models(raw: bool) -> None:
+    """List the models available from the configured provider."""
+    cfg = load_config()
+    problem = check_configured(cfg)
+    if problem:
+        print_error(ConfigurationError(problem))
+        raise SystemExit(1)
+
+    params = _params(cfg)
+    params["timeout"] = 15.0  # listing should never hang for long
+    try:
+        ids = asyncio.run(_list_models(params))
+    except PhoenixError as exc:
+        print_error(exc)
+        raise SystemExit(1)
+
+    if not ids:
+        console.print("[dim]The provider returned an empty model list.[/dim]")
+        raise SystemExit(1)
+
+    if raw:
+        for model_id in ids:
+            console.print(model_id)
+        return
+
+    current = cfg["model_name"]
+    console.print(
+        Text(
+            f"{len(ids)} model(s) available from {cfg['base_url']}",
+            style="bold",
+        )
+    )
+    console.print()
+    for model_id in ids:
+        if model_id == current:
+            console.print(Text(f"✓ {model_id}", style="bold #ff6b00"))
+        else:
+            console.print(Text(f"  {model_id}"))
+    console.print()
+    console.print(
+        "[dim]Tip: `phoenix setup` to change MODEL_NAME, or "
+        "`phoenix -m NAME \"prompt\"` for a one-off.[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------
