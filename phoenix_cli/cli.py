@@ -20,7 +20,6 @@ Design notes for Termux:
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import os
 import re
@@ -28,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import time
+import getpass as _getpass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,6 +40,12 @@ from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
+from rich.box import DOUBLE, HEAVY, ROUNDED, SQUARE, MINIMAL, HORIZONTALS
+from rich.prompt import Prompt, Confirm
+from rich.rule import Rule
+from rich.align import Align
+from rich.columns import Columns
+from rich import box
 
 from . import __version__
 from .client import (
@@ -75,6 +81,8 @@ from .mcp import (
 
 # Brand color (phoenix orange).
 ACCENT = "#ff6b00"
+ACCENT_DIM = "#ff8c33"
+ACCENT_2 = "#ff4500"
 
 # A short prompt shown by prompt_toolkit / the input() fallback.
 PROMPT_LABEL = "phoenix ❯ "
@@ -115,23 +123,344 @@ ERROR_HINTS: Dict[type, str] = {
 console = Console(highlight=False)
 
 # ---------------------------------------------------------------------------
+# UI helpers — retro-futuristic inspired by reference image
+# ---------------------------------------------------------------------------
+
+
+def _print_step_header(step: int, total: int, title: str, icon: str = "") -> None:
+    """Print a retro step header with progress bar."""
+    filled = "█" * step
+    empty = "░" * (total - step)
+    bar = f"[bold {ACCENT}]{filled}[/bold {ACCENT}][dim]{empty}[/dim]"
+    label = f"{icon} STEP {step}/{total} — {title}"
+    console.print()
+    console.print(Rule(f"[bold {ACCENT}]{label}[/bold {ACCENT}]", style=ACCENT, align="left"))
+    console.print(f"[dim]{bar} {step}/{total}[/dim]", justify="right")
+    console.print()
+
+
+def _ask_text_visible(question: str, default: str = "", placeholder: str = "") -> str:
+    """Robust visible prompt that works in TTY, PTY, and CliRunner."""
+    try:
+        if default:
+            console.print(f"[dim]Current: [cyan]{default}[/cyan] — press Enter to keep[/dim]")
+        prompt_str = f"[bold {ACCENT}]➤ {question}[/bold {ACCENT}]"
+        if placeholder:
+            prompt_str += f" [dim]{placeholder}[/dim]"
+        val = Prompt.ask(
+            prompt_str,
+            default="",
+            show_default=False,
+            console=console,
+        )
+        val = val.strip()
+        if not val and default:
+            return default
+        return val
+    except (KeyboardInterrupt, EOFError):
+        raise
+    except Exception:
+        try:
+            suffix = f" [{default}]" if default else ""
+            raw = input(f"{question}{suffix}: ").strip()
+            if not raw and default:
+                return default
+            return raw
+        except (EOFError, KeyboardInterrupt):
+            return default
+
+
+def _ask_api_key_secure(current: str = "") -> str:
+    """Ask for API key with multiple fallbacks so typing ALWAYS works.
+
+    Bug fix: previous implementation used click.prompt(hide_input=True) which
+    in some terminals (Termux, certain PTYs) would immediately return without
+    letting the user type. This version tries visible input first in non-TTY
+    (tests, CI) and hidden input in real terminals, with robust fallbacks.
+    """
+    masked = mask_secret(current) if current else "(none)"
+    console.print(
+        Panel(
+            f"[bold]Current:[/bold] {masked}\n"
+            f"[dim]• Leave empty for local servers (Ollama, LM Studio)\n"
+            f"• Press Enter to keep current value\n"
+            f"• Your key is stored with 0600 permissions in {config_path()}[/dim]",
+            title=f"[bold {ACCENT}]🔑 API Key — Secure Input[/bold {ACCENT}]",
+            border_style=ACCENT,
+            box=ROUNDED,
+            padding=(0, 1),
+        )
+    )
+
+    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+
+    # In non-TTY (CliRunner, pipes, tests) use visible prompt — guaranteed to work
+    if not is_tty:
+        try:
+            val = Prompt.ask(
+                f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}] [dim](Enter for none/local)[/dim]",
+                default="",
+                show_default=False,
+                console=console,
+            ).strip()
+            if not val:
+                return current or ""
+            return val
+        except Exception:
+            try:
+                val = input("API_KEY (Enter for none): ").strip()
+                if not val:
+                    return current or ""
+                return val
+            except (EOFError, KeyboardInterrupt):
+                return current or ""
+
+    # Real TTY — try hidden input methods in order
+
+    # 1. Try prompt_toolkit (best UX, hidden)
+    try:
+        from prompt_toolkit import prompt as pt_prompt  # type: ignore
+
+        console.print("[dim]Type your API key (input hidden) and press Enter...[/dim]")
+        val = pt_prompt("API_KEY ❯ ", is_password=True)
+        val = val.strip()
+        if not val:
+            return current or ""
+        return val
+    except Exception:
+        pass
+
+    # 2. Try Rich password prompt (hidden, works in most terminals)
+    try:
+        console.print("[dim]Input is hidden for security — type and press Enter (it WILL accept typing)[/dim]")
+        val = Prompt.ask(
+            f"[bold {ACCENT}]➤ API_KEY[/bold {ACCENT}] [dim](hidden)[/dim]",
+            default="",
+            show_default=False,
+            password=True,
+            console=console,
+        )
+        val = val.strip()
+        if not val:
+            return current or ""
+        return val
+    except (KeyboardInterrupt, EOFError):
+        raise
+    except Exception:
+        pass
+
+    # 3. Try getpass (hidden)
+    try:
+        console.print("[dim]Secure input (hidden)...[/dim]")
+        val = _getpass.getpass("API_KEY ❯ ").strip()
+        if not val:
+            return current or ""
+        return val
+    except (KeyboardInterrupt, EOFError):
+        raise
+    except Exception:
+        pass
+
+    # 4. Final fallback — VISIBLE input (guaranteed to work, fixes bug)
+    console.print(
+        "[yellow]⚠ Hidden input not supported in this terminal — falling back to visible input (still saved securely)[/yellow]"
+    )
+    try:
+        val = Prompt.ask(
+            f"[bold {ACCENT}]➤ API_KEY (visible fallback)[/bold {ACCENT}]",
+            default="",
+            show_default=False,
+            console=console,
+        )
+        val = val.strip()
+        if not val:
+            return current or ""
+        return val
+    except Exception:
+        try:
+            val = input("API_KEY (Enter for none): ").strip()
+            if not val:
+                return current or ""
+            return val
+        except (EOFError, KeyboardInterrupt):
+            return current or ""
+
+
+def _ask_base_url_with_ui(current: str) -> str:
+    """Ask for base URL with retro table UI — inspired by reference image."""
+    examples = Table(
+        title=f"[bold {ACCENT}]🌐 Provider Examples[/bold {ACCENT}]",
+        box=ROUNDED,
+        border_style=ACCENT,
+        header_style=f"bold {ACCENT}",
+        show_lines=False,
+        padding=(0, 1),
+        title_justify="left",
+    )
+    examples.add_column("Provider", style="bold", width=18)
+    examples.add_column("BASE_URL", style="cyan", overflow="fold")
+    examples.add_column("Key?", justify="center", width=6)
+    examples.add_row("Ollama (local)", "http://localhost:11434", "no")
+    examples.add_row("LM Studio", "http://localhost:1234", "no")
+    examples.add_row("vLLM", "http://localhost:8000", "—")
+    examples.add_row("OpenRouter", "https://openrouter.ai/api", "yes")
+    examples.add_row("Together AI", "https://api.together.xyz", "yes")
+    examples.add_row("Groq", "https://api.groq.com/openai", "yes")
+    examples.add_row("Custom", "myserver.example.com:8080", "—")
+    console.print(examples)
+    console.print(
+        "[dim]Tip: bare hostnames auto-get http:// and /v1 if no path — e.g. myserver:8080 → http://myserver:8080/v1[/dim]\n"
+    )
+
+    for attempt in range(3):
+        if current:
+            console.print(f"[dim]Current: [cyan]{current}[/cyan] — press Enter to keep[/dim]")
+        try:
+            raw = Prompt.ask(
+                f"[bold {ACCENT}]➤ BASE_URL[/bold {ACCENT}]",
+                default="",
+                show_default=False,
+                console=console,
+            ).strip()
+        except Exception:
+            try:
+                raw = input("BASE_URL: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                raw = ""
+
+        if not raw and current:
+            return current
+        if not raw:
+            console.print("[red]✖ BASE_URL cannot be empty[/red]")
+            continue
+        normalized = normalize_base_url(raw)
+        if not normalized or " " in normalized:
+            console.print(
+                Panel(
+                    f"[red]'{raw}' does not look like a valid URL[/red]\n[dim]Try: http://localhost:11434 or https://api.openrouter.ai/api[/dim]",
+                    border_style="red",
+                    box=SQUARE,
+                )
+            )
+            continue
+        console.print(f"[green]✔ Normalized → [cyan]{normalized}[/cyan][/green]")
+        return normalized
+
+    console.print("[red]Giving up on BASE_URL — run `phoenix setup` again.[/red]")
+    raise SystemExit(1)
+
+
+def _ask_model_name_with_ui(current: str) -> str:
+    """Ask for model name manually with retro UI."""
+    console.print(
+        Panel(
+            f"[dim]Could not auto-fetch models. Enter model name manually.\n"
+            f"Current: [cyan]{current or '(none)'}[/cyan][/dim]",
+            title=f"[bold {ACCENT}]🤖 Model Name[/bold {ACCENT}]",
+            border_style=ACCENT,
+            box=ROUNDED,
+        )
+    )
+    for attempt in range(3):
+        try:
+            raw = Prompt.ask(
+                f"[bold {ACCENT}]➤ MODEL_NAME[/bold {ACCENT}]",
+                default=current or "",
+                show_default=False,
+                console=console,
+            ).strip()
+        except Exception:
+            try:
+                raw = input(f"MODEL_NAME [{current}]: ").strip() or current
+            except (EOFError, KeyboardInterrupt):
+                raw = current
+
+        if raw:
+            return raw
+        console.print("[red]✖ MODEL_NAME cannot be empty[/red]")
+    console.print("[red]Giving up on MODEL_NAME — run `phoenix setup` again.[/red]")
+    raise SystemExit(1)
+
+
+def _ask_mcp_key_secure() -> str:
+    """Secure prompt for MCP server API keys — same robust fallback logic."""
+    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+    if not is_tty:
+        try:
+            return Prompt.ask(
+                f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}] [dim](Enter for none)[/dim]",
+                default="",
+                show_default=False,
+                console=console,
+            ).strip()
+        except Exception:
+            try:
+                return input("MCP API_KEY (Enter for none): ").strip()
+            except Exception:
+                return ""
+
+    try:
+        from prompt_toolkit import prompt as pt_prompt  # type: ignore
+
+        console.print("[dim]Type MCP API key (hidden)...[/dim]")
+        val = pt_prompt("MCP API_KEY ❯ ", is_password=True).strip()
+        return val
+    except Exception:
+        pass
+    try:
+        val = Prompt.ask(
+            f"[bold {ACCENT}]➤ MCP API Key[/bold {ACCENT}] [dim](hidden, Enter for none)[/dim]",
+            default="",
+            show_default=False,
+            password=True,
+            console=console,
+        ).strip()
+        return val
+    except Exception:
+        try:
+            val = _getpass.getpass("MCP API_KEY ❯ ").strip()
+            return val
+        except Exception:
+            try:
+                return input("MCP API_KEY (Enter for none): ").strip()
+            except Exception:
+                return ""
+
+
+# ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
 
 def print_banner() -> None:
-    """Print the ASCII logo (no figlet/toilet needed, unlike on desktop)."""
+    """Print the ASCII logo with retro panel — inspired by reference image."""
+    console.print(Rule(style=f"{ACCENT} dim"))
     console.print(BANNER)
-    console.print(f"[bold]{TAGLINE}[/bold]", justify="center")
-    console.print(f"[dim]v{__version__} • OpenAI-compatible APIs + MCP[/dim]", justify="center")
+    tagline_panel = Panel(
+        Align.center(
+            f"[bold]{TAGLINE}[/bold]\n[dim]v{__version__} • OpenAI-compatible APIs + MCP • Termux-ready[/dim]",
+            vertical="middle",
+        ),
+        box=DOUBLE,
+        border_style=ACCENT,
+        padding=(0, 2),
+    )
+    console.print(tagline_panel)
+    console.print(Rule(style=f"{ACCENT} dim"))
     console.print()
 
 
 def print_error(exc: Exception) -> None:
     """Print an exception with a clean layout and an actionable hint."""
     console.print()
-    console.print(Text(f"✖ {type(exc).__name__}", style="bold red"))
-    console.print(Text(str(exc)))
+    console.print(
+        Panel(
+            f"[bold red]✖ {type(exc).__name__}[/bold red]\n{str(exc)}",
+            border_style="red",
+            box=ROUNDED,
+            title="[red]Error[/red]",
+        )
+    )
     hint = ERROR_HINTS.get(type(exc))
     if hint is None:
         for klass, text in ERROR_HINTS.items():
@@ -139,7 +468,9 @@ def print_error(exc: Exception) -> None:
                 hint = text
                 break
     if hint:
-        console.print(Text(hint, style="dim"))
+        console.print(
+            Panel(f"[dim]{hint}[/dim]", border_style="yellow", box=SQUARE, title="💡 Hint")
+        )
 
 
 def _params(
@@ -205,14 +536,21 @@ async def _connect_mcp(cfg: Dict[str, str]) -> Optional[MCPManager]:
 
 def _ask_user_yn(prompt_text: str, default: bool = True) -> bool:
     """Ask the user a yes/no question. Returns True for yes."""
-    suffix = " [Y/n] " if default else " [y/N] "
     try:
-        answer = input(prompt_text + suffix).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return default
-    if answer == "":
-        return default
-    return answer in ("y", "yes", "1", "true")
+        return Confirm.ask(
+            f"[bold {ACCENT}]{prompt_text}[/bold {ACCENT}]",
+            default=default,
+            console=console,
+        )
+    except Exception:
+        suffix = " [Y/n] " if default else " [y/N] "
+        try:
+            answer = input(prompt_text + suffix).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return default
+        if answer == "":
+            return default
+        return answer in ("y", "yes", "1", "true")
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -234,15 +572,17 @@ def _copy_to_clipboard(text: str) -> bool:
     # Linux
     if shutil.which("xclip"):
         try:
-            subprocess.run(["xclip", "-selection", "clipboard"], input=text,
-                           text=True, timeout=5)
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"], input=text, text=True, timeout=5
+            )
             return True
         except Exception:
             return False
     if shutil.which("xsel"):
         try:
-            subprocess.run(["xsel", "--clipboard", "--input"], input=text,
-                           text=True, timeout=5)
+            subprocess.run(
+                ["xsel", "--clipboard", "--input"], input=text, text=True, timeout=5
+            )
             return True
         except Exception:
             return False
@@ -280,9 +620,10 @@ def _add_assistant_with_tool_calls(
     }
     # Add placeholder Message.
     from .client import Message
+
     conversation.messages.append(Message(role="assistant", content=content or ""))
     idx = len(conversation.messages) - 1
-    if not hasattr(conversation, '_tool_msgs'):
+    if not hasattr(conversation, "_tool_msgs"):
         conversation._tool_msgs: Dict[int, Dict[str, Any]] = {}
     conversation._tool_msgs[idx] = msg
 
@@ -295,9 +636,10 @@ def _add_tool_result(
 ) -> None:
     """Add a tool result message to the conversation."""
     from .client import Message
+
     conversation.messages.append(Message(role="tool", content=result))
     idx = len(conversation.messages) - 1
-    if not hasattr(conversation, '_tool_call_ids'):
+    if not hasattr(conversation, "_tool_call_ids"):
         conversation._tool_call_ids: Dict[int, Dict[str, str]] = {}
     conversation._tool_call_ids[idx] = {
         "tool_call_id": tool_call_id,
@@ -311,19 +653,21 @@ def _build_history_with_tools(conversation: Conversation) -> List[Dict[str, Any]
     if conversation.system:
         out.append({"role": "system", "content": conversation.system})
 
-    tool_msgs: Dict[int, Dict[str, Any]] = getattr(conversation, '_tool_msgs', {})
-    tool_ids: Dict[int, Dict[str, str]] = getattr(conversation, '_tool_call_ids', {})
+    tool_msgs: Dict[int, Dict[str, Any]] = getattr(conversation, "_tool_msgs", {})
+    tool_ids: Dict[int, Dict[str, str]] = getattr(conversation, "_tool_call_ids", {})
 
     for i, msg in enumerate(conversation.messages):
         if i in tool_msgs:
             out.append(tool_msgs[i])
         elif i in tool_ids:
-            out.append({
-                "role": "tool",
-                "content": msg.content,
-                "tool_call_id": tool_ids[i]["tool_call_id"],
-                "name": tool_ids[i]["name"],
-            })
+            out.append(
+                {
+                    "role": "tool",
+                    "content": msg.content,
+                    "tool_call_id": tool_ids[i]["tool_call_id"],
+                    "name": tool_ids[i]["name"],
+                }
+            )
         else:
             out.append(msg.to_dict())
     return out
@@ -333,7 +677,7 @@ _original_history = Conversation.history
 
 
 def _patched_history(self: Conversation) -> List[Dict[str, Any]]:
-    if hasattr(self, '_tool_msgs') and self._tool_msgs:
+    if hasattr(self, "_tool_msgs") and self._tool_msgs:
         return _build_history_with_tools(self)
     return _original_history(self)
 
@@ -479,6 +823,7 @@ async def _stream_turn(
                                 f"```json\n{json.dumps(fn_args, indent=2)}\n```",
                                 border_style="yellow",
                                 title="🔧 Tool call",
+                                box=ROUNDED,
                             )
                         )
                         if not _ask_user_yn("Execute this tool?", default=True):
@@ -498,9 +843,7 @@ async def _stream_turn(
                         result = await mcp_manager.call_tool(fn_name, fn_args)
                     except MCPError as exc:
                         result = f"Error: {exc}"
-                        console.print(
-                            Text(f"  ✖ {fn_name}: {exc}", style="red")
-                        )
+                        console.print(Text(f"  ✖ {fn_name}: {exc}", style="red"))
 
                     _add_tool_result(
                         conversation, tc.get("id", ""), fn_name, result
@@ -598,7 +941,7 @@ def _handle_slash_command(
 ) -> Optional[str]:
     """Interpret a ``/command`` typed in chat.
 
-    Returns ``"exit"`` when the user wants to leave, else ``None``.
+    Returns ``\"exit\"`` when the user wants to leave, else ``None``.
     """
     parts = command.split(None, 1)
     verb = parts[0].lower()
@@ -609,7 +952,9 @@ def _handle_slash_command(
         return "exit"
 
     if verb == "/help":
-        console.print(Panel(Markdown(HELP_TEXT), border_style=ACCENT, title="Phoenix CLI"))
+        console.print(
+            Panel(Markdown(HELP_TEXT), border_style=ACCENT, title="Phoenix CLI", box=DOUBLE)
+        )
 
     elif verb == "/clear":
         conversation.clear()
@@ -638,8 +983,12 @@ def _handle_slash_command(
                     console.print("[dim]Provider returned no models.[/dim]")
                 else:
                     console.print()
-                    table = Table(border_style="bright_black", show_header=True,
-                                  box=None, header_style="bold")
+                    table = Table(
+                        border_style="bright_black",
+                        show_header=True,
+                        box=None,
+                        header_style="bold",
+                    )
                     table.add_column("#", style="dim", width=5)
                     table.add_column("Model", style="bold")
                     for i, mid in enumerate(ids, 1):
@@ -650,7 +999,9 @@ def _handle_slash_command(
                     try:
                         choice = click.prompt(
                             "Enter number (0 to skip)",
-                            type=int, default=0, show_default=True,
+                            type=int,
+                            default=0,
+                            show_default=True,
                         )
                     except (KeyboardInterrupt, click.Abort):
                         console.print()
@@ -658,8 +1009,9 @@ def _handle_slash_command(
                     if 1 <= choice <= len(ids):
                         state["model"] = ids[choice - 1]
                         console.print(
-                            Text(f"✔ switched to: {state['model']}",
-                                 style="bold green")
+                            Text(
+                                f"✔ switched to: {state['model']}", style="bold green"
+                            )
                         )
                     elif choice != 0:
                         console.print(
@@ -694,8 +1046,12 @@ def _handle_slash_command(
             if not ids:
                 console.print("[dim]Provider returned no models.[/dim]")
                 return None
-            table = Table(border_style="bright_black", show_header=True,
-                          box=None, header_style="bold")
+            table = Table(
+                border_style="bright_black",
+                show_header=True,
+                box=None,
+                header_style="bold",
+            )
             table.add_column("#", style="dim", width=5)
             table.add_column("Model", style="bold")
             for i, mid in enumerate(ids, 1):
@@ -741,7 +1097,7 @@ def _handle_slash_command(
     # --- Conversation -------------------------------------------------------
     elif verb == "/history":
         count = len(conversation.messages)
-        pinned = len(getattr(conversation, '_pinned_notes', []))
+        pinned = len(getattr(conversation, "_pinned_notes", []))
         console.print(
             f"[dim]{count} messages in memory "
             f"(limit {conversation.max_messages}, oldest are dropped)"
@@ -761,7 +1117,8 @@ def _handle_slash_command(
             # Remove the last assistant message (and the user message before it).
             removed = 0
             while conversation.messages and conversation.messages[-1].role in (
-                "assistant", "tool"
+                "assistant",
+                "tool",
             ):
                 idx = len(conversation.messages) - 1
                 for attr in ("_tool_msgs", "_tool_call_ids"):
@@ -772,9 +1129,7 @@ def _handle_slash_command(
             if conversation.messages and conversation.messages[-1].role == "user":
                 conversation.messages.pop()
                 removed += 1
-            console.print(
-                Text(f"✔ removed {removed} message(s)", style="dim green")
-            )
+            console.print(Text(f"✔ removed {removed} message(s)", style="dim green"))
 
     elif verb == "/retry":
         if not conversation.messages:
@@ -782,7 +1137,8 @@ def _handle_slash_command(
         else:
             # Remove the last assistant message(s).
             while conversation.messages and conversation.messages[-1].role in (
-                "assistant", "tool"
+                "assistant",
+                "tool",
             ):
                 idx = len(conversation.messages) - 1
                 for attr in ("_tool_msgs", "_tool_call_ids"):
@@ -819,14 +1175,10 @@ def _handle_slash_command(
                 console.print()
                 for idx, role, text in hits:
                     snippet = text.replace("\n", " ")[:80]
-                    console.print(
-                        f"[dim]#{idx:3d}  {role:12s}  {snippet}[/dim]"
-                    )
+                    console.print(f"[dim]#{idx:3d}  {role:12s}  {snippet}[/dim]")
 
     elif verb == "/compact":
-        console.print(
-            "[dim]Asking the model to summarize the conversation...[/dim]"
-        )
+        console.print("[dim]Asking the model to summarize the conversation...[/dim]")
         # Build a compact prompt.
         original_system = conversation.system
         conversation.system = (
@@ -840,7 +1192,9 @@ def _handle_slash_command(
         try:
             ok, summary = asyncio.run(
                 _stream_turn(
-                    params, conversation, use_live=use_live,
+                    params,
+                    conversation,
+                    use_live=use_live,
                     mcp_manager=None,  # no tools during compact
                     auto_approve=True,
                     theme=state.get("theme", "monokai"),
@@ -860,8 +1214,10 @@ def _handle_slash_command(
                     getattr(conversation, attr).clear()
             conversation.add("user", f"[compact summary of prior chat]\n{summary}")
             console.print(
-                Text(f"✔ conversation compacted ({len(summary)} chars)",
-                     style="bold green")
+                Text(
+                    f"✔ conversation compacted ({len(summary)} chars)",
+                    style="bold green",
+                )
             )
         else:
             console.print("[red]compact failed — history unchanged[/red]")
@@ -879,8 +1235,10 @@ def _handle_slash_command(
             encoding="utf-8",
         )
         console.print(
-            Text(f"✔ exported {len(conversation.messages)} message(s) to {target}",
-                 style="dim green")
+            Text(
+                f"✔ exported {len(conversation.messages)} message(s) to {target}",
+                style="dim green",
+            )
         )
 
     elif verb == "/import":
@@ -909,8 +1267,10 @@ def _handle_slash_command(
                             conversation.add(role, content)
                     n = len(conversation.messages)
                     console.print(
-                        Text(f"✔ imported {n} message(s) from {target}",
-                             style="bold green")
+                        Text(
+                            f"✔ imported {n} message(s) from {target}",
+                            style="bold green",
+                        )
                     )
 
     # --- MCP & tools --------------------------------------------------------
@@ -934,9 +1294,7 @@ def _handle_slash_command(
             for s in servers:
                 console.print(f"  ● {s}")
             auto = state.get("auto_approve", True)
-            console.print(
-                f"[dim]auto-approve: {'ON' if auto else 'OFF'}[/dim]"
-            )
+            console.print(f"[dim]auto-approve: {'ON' if auto else 'OFF'}[/dim]")
         else:
             console.print("[dim]MCP not connected.[/dim]")
             console.print(
@@ -947,20 +1305,22 @@ def _handle_slash_command(
     elif verb == "/auto":
         if not arg:
             cur = state.get("auto_approve", True)
-            console.print(
-                f"[dim]tool auto-approve = {'ON' if cur else 'OFF'}[/dim]"
-            )
+            console.print(f"[dim]tool auto-approve = {'ON' if cur else 'OFF'}[/dim]")
         elif arg.lower() in ("on", "1", "true", "yes"):
             state["auto_approve"] = True
             console.print(
-                Text("✔ auto-approve ON — tools run without prompts",
-                     style="bold green")
+                Text(
+                    "✔ auto-approve ON — tools run without prompts",
+                    style="bold green",
+                )
             )
         elif arg.lower() in ("off", "0", "false", "no"):
             state["auto_approve"] = False
             console.print(
-                Text("✔ auto-approve OFF — will ask before each tool call",
-                     style="bold yellow")
+                Text(
+                    "✔ auto-approve OFF — will ask before each tool call",
+                    style="bold yellow",
+                )
             )
         else:
             console.print("[red]usage: /auto on | /auto off[/red]")
@@ -975,17 +1335,16 @@ def _handle_slash_command(
         table.add_row("model", state["model"])
         table.add_row("url", cfg["base_url"])
         table.add_row("api_key", mask_secret(cfg.get("api_key", "")))
-        table.add_row("temperature",
-                       str(state.get("temperature") or "(default)"))
-        table.add_row("max-tokens",
-                       str(state.get("max_tokens") or "(no cap)"))
-        table.add_row("auto-approve",
-                       "ON" if state.get("auto_approve", True) else "OFF")
+        table.add_row(
+            "temperature", str(state.get("temperature") or "(default)")
+        )
+        table.add_row("max-tokens", str(state.get("max_tokens") or "(no cap)"))
+        table.add_row(
+            "auto-approve", "ON" if state.get("auto_approve", True) else "OFF"
+        )
         table.add_row("theme", state.get("theme", "monokai"))
-        table.add_row("verbose",
-                       "ON" if state.get("verbose", False) else "OFF")
-        table.add_row("mcp",
-                       "ON" if cfg.get("mcp_enabled") else "off")
+        table.add_row("verbose", "ON" if state.get("verbose", False) else "OFF")
+        table.add_row("mcp", "ON" if cfg.get("mcp_enabled") else "off")
         table.add_row("messages", str(len(conversation.messages)))
         console.print(table)
 
@@ -1002,8 +1361,7 @@ def _handle_slash_command(
         if ok:
             latency = (time.perf_counter() - t0) * 1000
             console.print(
-                Text(f"✓ provider reachable — {latency:.0f} ms",
-                     style="bold green")
+                Text(f"✓ provider reachable — {latency:.0f} ms", style="bold green")
             )
 
     elif verb == "/config":
@@ -1022,27 +1380,23 @@ def _handle_slash_command(
 
     elif verb == "/theme":
         if not arg:
-            console.print(
-                "[dim]available themes: " + ", ".join(CODE_THEMES)
-            )
+            console.print("[dim]available themes: " + ", ".join(CODE_THEMES))
             console.print(f"[dim]current: {state.get('theme', 'monokai')}[/dim]")
         elif arg in CODE_THEMES:
             state["theme"] = arg
-            console.print(
-                Text(f"✔ theme switched to {arg}", style="bold green")
-            )
+            console.print(Text(f"✔ theme switched to {arg}", style="bold green"))
         else:
             console.print(
-                Text(f"unknown theme {arg!r} — choose from: "
-                     + ", ".join(CODE_THEMES), style="red")
+                Text(
+                    f"unknown theme {arg!r} — choose from: " + ", ".join(CODE_THEMES),
+                    style="red",
+                )
             )
 
     elif verb == "/verbose":
         if not arg:
             cur = state.get("verbose", False)
-            console.print(
-                f"[dim]verbose = {'ON' if cur else 'OFF'}[/dim]"
-            )
+            console.print(f"[dim]verbose = {'ON' if cur else 'OFF'}[/dim]")
         elif arg.lower() in ("on", "1", "true", "yes"):
             state["verbose"] = True
             console.print(Text("✔ verbose ON", style="bold green"))
@@ -1056,8 +1410,10 @@ def _handle_slash_command(
         # Rough token count estimate (chars / 4).
         total_chars = sum(len(m.content) for m in conversation.messages)
         estimated = total_chars // 4
-        console.print(f"[dim]~{estimated} tokens in context "
-                      f"({total_chars} chars, {len(conversation.messages)} msgs)[/dim]")
+        console.print(
+            f"[dim]~{estimated} tokens in context "
+            f"({total_chars} chars, {len(conversation.messages)} msgs)[/dim]"
+        )
 
     elif verb == "/copy":
         # Find the last assistant message.
@@ -1071,8 +1427,10 @@ def _handle_slash_command(
         else:
             if _copy_to_clipboard(last_reply):
                 console.print(
-                    Text(f"✔ copied {len(last_reply)} chars to clipboard",
-                         style="bold green")
+                    Text(
+                        f"✔ copied {len(last_reply)} chars to clipboard",
+                        style="bold green",
+                    )
                 )
             else:
                 # Fallback: print plain for manual copy.
@@ -1100,18 +1458,16 @@ def _handle_slash_command(
         if not arg:
             console.print("[red]usage: /pin TEXT[/red]")
         else:
-            if not hasattr(conversation, '_pinned_notes'):
+            if not hasattr(conversation, "_pinned_notes"):
                 conversation._pinned_notes: List[str] = []
             conversation._pinned_notes.append(arg)
             n = len(conversation._pinned_notes)
-            console.print(
-                Text(f"✔ pinned note #{n}: {arg}", style="bold green")
-            )
+            console.print(Text(f"✔ pinned note #{n}: {arg}", style="bold green"))
             # Update system prompt to include pinned notes.
             _update_system_with_pins(conversation)
 
     elif verb == "/pinned":
-        notes = getattr(conversation, '_pinned_notes', [])
+        notes = getattr(conversation, "_pinned_notes", [])
         if not notes:
             console.print("[dim]no pinned notes[/dim]")
         else:
@@ -1120,7 +1476,7 @@ def _handle_slash_command(
                 console.print(f"  {i}. {note}")
 
     elif verb == "/unpin":
-        notes = getattr(conversation, '_pinned_notes', [])
+        notes = getattr(conversation, "_pinned_notes", [])
         if not arg:
             console.print("[red]usage: /unpin N[/red]")
         else:
@@ -1132,28 +1488,30 @@ def _handle_slash_command(
                 if 0 <= idx < len(notes):
                     removed = notes.pop(idx)
                     console.print(
-                        Text(f"✔ removed pinned note #{idx+1}: {removed}",
-                             style="bold green")
+                        Text(
+                            f"✔ removed pinned note #{idx+1}: {removed}",
+                            style="bold green",
+                        )
                     )
                     _update_system_with_pins(conversation)
                 else:
                     console.print(
-                        Text(f"invalid number — have {len(notes)} note(s)",
-                             style="red")
+                        Text(
+                            f"invalid number — have {len(notes)} note(s)",
+                            style="red",
+                        )
                     )
 
     # --- Unknown ------------------------------------------------------------
     else:
-        console.print(
-            Text(f"unknown command {verb!r} — try /help", style="red")
-        )
+        console.print(Text(f"unknown command {verb!r} — try /help", style="red"))
 
     return None
 
 
 def _update_system_with_pins(conversation: Conversation) -> None:
     """Merge pinned notes into the conversation's system prompt."""
-    notes = getattr(conversation, '_pinned_notes', [])
+    notes = getattr(conversation, "_pinned_notes", [])
     if notes:
         pinned_block = "\n\n[Pinned notes — always follow these]\n" + "\n".join(
             f"• {n}" for n in notes
@@ -1211,8 +1569,13 @@ def _make_session(interactive: bool) -> Optional[Any]:
         return None
 
 
-def run_chat(cfg: Dict[str, str], system: Optional[str], model: Optional[str],
-             temperature: Optional[float], max_tokens: Optional[int]) -> int:
+def run_chat(
+    cfg: Dict[str, str],
+    system: Optional[str],
+    model: Optional[str],
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+) -> int:
     """The interactive chat loop. Returns the process exit code."""
     interactive = sys.stdin.isatty() and console.is_terminal
     if not interactive:
@@ -1239,7 +1602,9 @@ def run_chat(cfg: Dict[str, str], system: Optional[str], model: Optional[str],
     conversation._tool_call_ids = {}
 
     print_banner()
-    console.print(f"[bold]Model:[/bold] [bold #ff6b00]{state['model']}[/bold #ff6b00]")
+    console.print(
+        f"[bold]Model:[/bold] [bold #ff6b00]{state['model']}[/bold #ff6b00]"
+    )
     console.print(f"[bold]API:[/bold]   {cfg['base_url']}")
 
     mcp_manager = None
@@ -1255,9 +1620,7 @@ def run_chat(cfg: Dict[str, str], system: Optional[str], model: Optional[str],
             f"{len(mcp_manager.connected_servers)} server(s)"
         )
         auto = state.get("auto_approve", True)
-        console.print(
-            f"[bold]Auto-approve:[/bold] {'ON' if auto else 'OFF'}"
-        )
+        console.print(f"[bold]Auto-approve:[/bold] {'ON' if auto else 'OFF'}")
 
     console.print("[dim]Type /help for 30+ commands • Ctrl+C cancels a reply[/dim]")
     console.print()
@@ -1280,9 +1643,16 @@ def run_chat(cfg: Dict[str, str], system: Optional[str], model: Optional[str],
         if not text:
             continue
         if text.startswith("/"):
-            if _handle_slash_command(
-                text, conversation, state, cfg, mcp_manager,
-            ) == "exit":
+            if (
+                _handle_slash_command(
+                    text,
+                    conversation,
+                    state,
+                    cfg,
+                    mcp_manager,
+                )
+                == "exit"
+            ):
                 console.print("[dim]Bye![/dim]")
                 break
             if state.pop("_retry", False):
@@ -1351,8 +1721,11 @@ def run_single_prompt(
     try:
         ok, _ = asyncio.run(
             _stream_turn(
-                params, conversation, use_live=use_live,
-                mcp_manager=mcp_manager, auto_approve=True,
+                params,
+                conversation,
+                use_live=use_live,
+                mcp_manager=mcp_manager,
+                auto_approve=True,
             )
         )
     except KeyboardInterrupt:
@@ -1397,43 +1770,67 @@ async def _list_models(params: Dict[str, Any]) -> List[str]:
 
 
 def _select_model_interactive(model_ids: List[str], current: str = "") -> Optional[str]:
-    """Show a numbered list and let the user pick a model."""
+    """Show a numbered list and let the user pick a model — retro UI."""
     console.print()
-    console.print("[bold]Select a model (enter its number):[/bold]")
+    console.print(
+        Panel(
+            f"[bold]Found {len(model_ids)} model(s)[/bold]\n[dim]Select by number — current marked with ✓[/dim]",
+            title=f"[bold {ACCENT}]🤖 Model Picker[/bold {ACCENT}]",
+            border_style=ACCENT,
+            box=ROUNDED,
+        )
+    )
     console.print()
 
-    table = Table(border_style="bright_black", show_header=True, box=None,
-                  header_style="bold")
-    table.add_column("#", style="dim", width=5)
+    table = Table(
+        box=ROUNDED,
+        border_style=ACCENT,
+        header_style=f"bold {ACCENT}",
+        show_header=True,
+        padding=(0, 1),
+    )
+    table.add_column("#", style="dim", width=5, justify="right")
     table.add_column("Model", style="bold")
+    table.add_column("Status", style="dim", width=8)
 
     for i, model_id in enumerate(model_ids, 1):
-        marker = "  ✓" if model_id == current else ""
-        table.add_row(str(i), model_id + marker)
+        status = "✓ current" if model_id == current else ""
+        style = f"bold {ACCENT}" if model_id == current else ""
+        table.add_row(str(i), f"[{style}]{model_id}[/{style}]" if style else model_id, status)
 
     console.print(table)
     console.print()
 
     while True:
         try:
-            choice = click.prompt(
-                "Enter number (0 to skip)",
-                type=int, default=0, show_default=True,
+            choice = Prompt.ask(
+                f"[bold {ACCENT}]➤ Enter number[/bold {ACCENT}] [dim](0 to skip)[/dim]",
+                default="0",
+                show_default=False,
+                console=console,
             )
-        except (KeyboardInterrupt, click.Abort):
+            choice_int = int(choice.strip() or "0")
+        except (KeyboardInterrupt, EOFError):
             return None
+        except ValueError:
+            console.print("[red]Please enter a number[/red]")
+            continue
+        except Exception:
+            try:
+                choice_int = click.prompt(
+                    "Enter number (0 to skip)", type=int, default=0, show_default=True
+                )
+            except (KeyboardInterrupt, click.Abort):
+                return None
 
-        if choice == 0:
+        if choice_int == 0:
             return None
-        if 1 <= choice <= len(model_ids):
-            selected = model_ids[choice - 1]
-            console.print(
-                Text(f"✓ selected: {selected}", style="bold green")
-            )
+        if 1 <= choice_int <= len(model_ids):
+            selected = model_ids[choice_int - 1]
+            console.print(Text(f"✔ selected: {selected}", style="bold green"))
             return selected
         console.print(
-            Text(f"Invalid number. Enter 1-{len(model_ids)} or 0 to skip.",
-                 style="red")
+            Text(f"Invalid number. Enter 1-{len(model_ids)} or 0 to skip.", style="red")
         )
 
 
@@ -1464,11 +1861,24 @@ class PhoenixGroup(click.Group):
 
 @click.group(cls=PhoenixGroup)
 @click.version_option(version=__version__, prog_name="phoenix")
-@click.option("--system", "-s", default=None, help="System prompt for this request/chat.")
+@click.option(
+    "--system", "-s", default=None, help="System prompt for this request/chat."
+)
 @click.option("--model", "-m", default=None, help="Model override for this request/chat.")
-@click.option("--temperature", "-t", type=float, default=None, help="Sampling temperature.")
-@click.option("--max-tokens", type=click.IntRange(min=1), default=None, help="Cap the reply length.")
-@click.option("--no-stream", is_flag=True, help="Print the reply only when complete (scripts/pipes).")
+@click.option(
+    "--temperature", "-t", type=float, default=None, help="Sampling temperature."
+)
+@click.option(
+    "--max-tokens",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Cap the reply length.",
+)
+@click.option(
+    "--no-stream",
+    is_flag=True,
+    help="Print the reply only when complete (scripts/pipes).",
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
@@ -1485,25 +1895,53 @@ def cli(
     """
     if ctx.invoked_subcommand is None:
         print_banner()
+        # Retro quick-start dashboard inspired by reference image
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column()
+        grid.add_column()
+
+        left = Panel(
+            f"[bold {ACCENT}]⚙️ Setup & Config[/bold {ACCENT}]\n"
+            f"  [bold #ff6b00]phoenix setup[/bold #ff6b00]            configure provider + model\n"
+            f"  [bold #ff6b00]phoenix status[/bold #ff6b00]           show current configuration\n"
+            f"  [bold #ff6b00]phoenix models --select[/bold #ff6b00]  pick model from list\n"
+            f"  [bold #ff6b00]phoenix mcp add[/bold #ff6b00]          add MCP server\n\n"
+            f"[bold {ACCENT}]💬 Chat & Prompt[/bold {ACCENT}]\n"
+            f"  [bold #ff6b00]phoenix \"explain quicksort\"[/bold #ff6b00]  one-shot prompt\n"
+            f"  [bold #ff6b00]phoenix chat[/bold #ff6b00]            interactive chat (30+ commands)\n"
+            f"  [bold #ff6b00]phoenix -m NAME \"prompt\"[/bold #ff6b00]  one-off model override",
+            box=ROUNDED,
+            border_style=ACCENT,
+            title=f"[bold]Quick start[/bold]",
+            padding=(1, 2),
+        )
+
+        right = Panel(
+            f"[bold]Examples[/bold]\n"
+            f"[dim]Local Ollama:[/dim]\n"
+            f"  http://localhost:11434\n\n"
+            f"[dim]Cloud:[/dim]\n"
+            f"  https://api.openrouter.ai/api\n"
+            f"  https://api.groq.com/openai\n\n"
+            f"[bold]Features[/bold]\n"
+            f"  • Any OpenAI-compatible API\n"
+            f"  • MCP tools (Roblox etc.)\n"
+            f"  • 30+ chat commands\n"
+            f"  • Termux-ready\n"
+            f"  • Streaming + markdown",
+            box=ROUNDED,
+            border_style="bright_black",
+            title="[bold]Info[/bold]",
+            padding=(1, 2),
+        )
+
         console.print(
-            Panel.fit(
-                "  [bold]Quick start[/bold]\n"
-                "  [bold #ff6b00]phoenix setup[/bold #ff6b00]                    "
-                "configure provider + model\n"
-                "  [bold #ff6b00]phoenix \"explain quicksort\"[/bold #ff6b00]    "
-                "one-shot prompt\n"
-                "  [bold #ff6b00]phoenix chat[/bold #ff6b00]                    "
-                "interactive chat with 30+ commands\n"
-                "  [bold #ff6b00]phoenix models --select[/bold #ff6b00]         "
-                "pick a model from a numbered list\n"
-                "  [bold #ff6b00]phoenix mcp add[/bold #ff6b00]                 "
-                "add an MCP server (e.g. Roblox)\n"
-                "  [bold #ff6b00]phoenix status[/bold #ff6b00]                  "
-                "show current configuration\n"
-                "\n"
-                "  [dim]Type /help inside chat to see every command.[/dim]",
+            Panel(
+                Columns([left, right], equal=True, expand=True),
+                box=DOUBLE,
                 border_style=ACCENT,
-                title="Phoenix CLI",
+                title=f"[bold {ACCENT}]🔥 Phoenix CLI v{__version__}[/bold {ACCENT}]",
+                subtitle="[dim]Type /help inside chat to see every command[/dim]",
             )
         )
 
@@ -1518,49 +1956,41 @@ def setup() -> None:
     print_banner()
     current = load_config()
 
-    console.print(
-        "[bold]Phoenix setup[/bold] — the provider can be any OpenAI-compatible "
-        "API. Press Enter to keep the current value."
+    # Wizard intro panel — retro dashboard style
+    intro = Panel(
+        Align.center(
+            f"[bold {ACCENT}]Welcome to the Phoenix Setup Wizard[/bold {ACCENT}]\n"
+            f"[dim]Configure any OpenAI-compatible provider in 4 steps.\n"
+            f"Press Enter to keep current values.[/dim]\n\n"
+            f"[bold]Current Config:[/bold] [dim]{config_path()}[/dim]\n"
+            f"BASE_URL: [cyan]{current['base_url'] or '(not set)'}[/cyan]\n"
+            f"API_KEY: {mask_secret(current['api_key'])}\n"
+            f"MODEL: [cyan]{current['model_name'] or '(not set)'}[/cyan]",
+            vertical="middle",
+        ),
+        box=DOUBLE,
+        border_style=ACCENT,
+        title="⚙️ Setup Wizard",
+        padding=(1, 2),
     )
-    console.print()
+    console.print(intro)
 
-    def url_hint() -> None:
-        console.print(
-            "[dim]examples:\n"
-            "  Ollama (local)     http://localhost:11434\n"
-            "  LM Studio (local)  http://localhost:1234\n"
-            "  vLLM (local)       http://localhost:8000\n"
-            "  OpenRouter         https://openrouter.ai/api\n"
-            "  Together AI        https://api.together.xyz\n"
-            "  Groq               https://api.groq.com/openai\n"
-            "  Any custom server    myserver.example.com:8080[/dim]"
-        )
+    # STEP 1 — Base URL
+    _print_step_header(1, 4, "PROVIDER ENDPOINT", "🌐")
+    base_url = _ask_base_url_with_ui(current["base_url"])
 
-    url_hint()
-    base_url = ""
-    for _attempt in range(3):
-        raw = click.prompt(
-            "BASE_URL", default=current["base_url"] or "", show_default=False
-        )
-        base_url = normalize_base_url(raw)
-        if not base_url or " " in base_url:
-            console.print("[red]That does not look like a valid URL.[/red]")
-            url_hint()
-            continue
-        break
-    if not base_url:
-        console.print("[red]Giving up on BASE_URL — run `phoenix setup` again.[/red]")
+    # STEP 2 — API Key (BUG FIXED HERE)
+    _print_step_header(2, 4, "AUTHENTICATION", "🔑")
+    try:
+        api_key = _ask_api_key_secure(current["api_key"])
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[dim]Setup cancelled[/dim]")
         raise SystemExit(1)
 
-    api_key = click.prompt(
-        "API_KEY (Enter for none — local servers usually need none)",
-        default=current["api_key"] or "",
-        hide_input=True,
-        show_default=False,
-    ).strip()
+    # STEP 3 — Model
+    _print_step_header(3, 4, "MODEL SELECTION", "🤖")
+    console.print(f"[dim]Contacting [cyan]{base_url}[/cyan] to fetch models...[/dim]")
 
-    console.print()
-    console.print("[dim]Connecting to the provider to fetch models...[/dim]")
     params = {
         "base_url": base_url,
         "api_key": api_key,
@@ -1568,62 +1998,99 @@ def setup() -> None:
         "timeout": 15.0,
     }
     model_name = ""
-    try:
-        ids = asyncio.run(_list_models(params))
-        if ids:
+    with console.status(
+        f"[bold {ACCENT}]Fetching models from provider...[/bold {ACCENT}]",
+        spinner="dots12",
+    ):
+        try:
+            ids = asyncio.run(_list_models(params))
+        except PhoenixError as exc:
+            ids = []
+            fetch_error = exc
+        except Exception as exc:
+            ids = []
+            fetch_error = exc
+        else:
+            fetch_error = None
+
+    if fetch_error is None and ids:
+        console.print(Text(f"✔ found {len(ids)} model(s)", style="bold green"))
+        selected = _select_model_interactive(ids, current=current["model_name"])
+        if selected:
+            model_name = selected
+    else:
+        if fetch_error:
             console.print(
-                Text(f"✓ found {len(ids)} model(s)", style="bold green")
+                Panel(
+                    f"[yellow]⚠ Could not fetch models: {type(fetch_error).__name__}: {fetch_error}[/yellow]\n"
+                    f"[dim]You can enter the model name manually.[/dim]",
+                    border_style="yellow",
+                    box=ROUNDED,
+                )
             )
-            selected = _select_model_interactive(
-                ids, current=current["model_name"]
-            )
-            if selected:
-                model_name = selected
-    except PhoenixError as exc:
-        console.print(
-            Text(f"⚠ could not fetch models: {type(exc).__name__}", style="yellow")
-        )
-        console.print("[dim]You can enter the model name manually.[/dim]")
-    except Exception:
-        console.print(
-            Text("⚠ could not fetch models (connection error)", style="yellow")
-        )
-        console.print("[dim]You can enter the model name manually.[/dim]")
+        else:
+            console.print("[yellow]⚠ Provider returned no models — enter manually[/yellow]")
 
     if not model_name:
         console.print()
-        for _attempt in range(3):
-            model_name = click.prompt(
-                "MODEL_NAME", default=current["model_name"] or "", show_default=False
-            ).strip()
-            if model_name:
-                break
-            console.print("[red]MODEL_NAME cannot be empty.[/red]")
-        if not model_name:
-            console.print("[red]Giving up on MODEL_NAME — run `phoenix setup` again.[/red]")
-            raise SystemExit(1)
+        model_name = _ask_model_name_with_ui(current["model_name"])
 
-    console.print()
-    mcp_enabled = click.confirm(
-        "Enable MCP (Model Context Protocol) tools? (for Roblox MCP etc.)",
-        default=bool(current.get("mcp_enabled")),
+    # STEP 4 — MCP
+    _print_step_header(4, 4, "EXTENSIONS", "🔧")
+    console.print(
+        Panel(
+            "[bold]MCP (Model Context Protocol)[/bold] lets your AI use tools —\n"
+            "e.g. Roblox MCP server to build games from terminal.\n"
+            "[dim]You can add servers later with [bold #ff6b00]phoenix mcp add[/bold #ff6b00][/dim]",
+            box=ROUNDED,
+            border_style="bright_black",
+        )
     )
+    try:
+        mcp_enabled = Confirm.ask(
+            f"[bold {ACCENT}]Enable MCP tools?[/bold {ACCENT}]",
+            default=bool(current.get("mcp_enabled")),
+            console=console,
+        )
+    except Exception:
+        mcp_enabled = click.confirm(
+            "Enable MCP (Model Context Protocol) tools? (for Roblox MCP etc.)",
+            default=bool(current.get("mcp_enabled")),
+        )
 
     path = save_config(
-        base_url=base_url, api_key=api_key, model_name=model_name,
+        base_url=base_url,
+        api_key=api_key,
+        model_name=model_name,
         mcp_enabled=mcp_enabled,
     )
 
+    # Final summary — double border, retro dashboard
     console.print()
-    console.print(Panel(
-        f"  [bold]BASE_URL[/bold]     {base_url}\n"
-        f"  [bold]API_KEY[/bold]      {mask_secret(api_key)}\n"
-        f"  [bold]MODEL_NAME[/bold]   {model_name}\n"
-        f"  [bold]MCP[/bold]          {'enabled' if mcp_enabled else 'disabled'}",
+    console.print(Rule(f"[bold green]✔ Configuration Saved[/bold green]", style="green"))
+    summary_table = Table(
+        box=ROUNDED,
         border_style="green",
-        title="Saved",
-    ))
-    console.print(f"[dim]Config written to {path}[/dim]")
+        show_header=False,
+        padding=(0, 1),
+    )
+    summary_table.add_column("Key", style="bold", width=12)
+    summary_table.add_column("Value", style="cyan")
+    summary_table.add_row("BASE_URL", base_url)
+    summary_table.add_row("API_KEY", mask_secret(api_key))
+    summary_table.add_row("MODEL", model_name)
+    summary_table.add_row("MCP", "enabled" if mcp_enabled else "disabled")
+    summary_table.add_row("File", str(path))
+
+    console.print(
+        Panel(
+            summary_table,
+            title="[bold green]🔥 Saved[/bold green]",
+            border_style="green",
+            box=DOUBLE,
+            padding=(1, 2),
+        )
+    )
 
     if mcp_enabled:
         servers = load_mcp_config()
@@ -1634,15 +2101,24 @@ def setup() -> None:
             )
         else:
             console.print(
-                "[dim]No MCP servers configured yet. Run "
-                "[bold #ff6b00]phoenix mcp add[/bold #ff6b00] to add one.[/dim]"
+                Panel(
+                    f"[dim]No MCP servers yet. Run [bold #ff6b00]phoenix mcp add[/bold #ff6b00] to add one — e.g. Roblox MCP[/dim]",
+                    box=SQUARE,
+                    border_style=ACCENT,
+                )
             )
 
     console.print()
-    console.print(
-        "[bold]Next:[/bold] try [bold #ff6b00]phoenix \"hello!\"[/bold #ff6b00] "
-        "or start a conversation with [bold #ff6b00]phoenix chat[/bold #ff6b00]"
+    next_steps = Panel(
+        f"[bold]Next:[/bold]\n"
+        f"  [bold #ff6b00]phoenix \"hello!\"[/bold #ff6b00]  — quick test\n"
+        f"  [bold #ff6b00]phoenix chat[/bold #ff6b00]       — interactive chat with 30+ commands\n"
+        f"  [bold #ff6b00]phoenix status --probe[/bold #ff6b00] — test connection",
+        box=ROUNDED,
+        border_style=ACCENT,
+        title="🚀 Ready",
     )
+    console.print(next_steps)
 
 
 @cli.command()
@@ -1652,10 +2128,17 @@ def status(probe: bool) -> None:
     cfg = load_config()
     path = config_path()
 
-    console.print("[bold]Phoenix status[/bold]")
+    console.print(
+        Panel(
+            f"[bold {ACCENT}]Phoenix Status[/bold {ACCENT}]",
+            box=DOUBLE,
+            border_style=ACCENT,
+            padding=(0, 2),
+        )
+    )
     console.print()
-    table = Table(border_style="bright_black", show_header=False, box=None)
-    table.add_column(style="bold")
+    table = Table(box=ROUNDED, border_style=ACCENT, show_header=False, padding=(0, 1))
+    table.add_column(style="bold", width=14)
     table.add_column()
 
     def source(env_name: str) -> str:
@@ -1665,9 +2148,18 @@ def status(probe: bool) -> None:
             else f"file ({path})"
         )
 
-    table.add_row("BASE_URL", f"{cfg['base_url'] or '(not set)'}  [dim]← {source(ENV_BASE_URL)}[/dim]")
-    table.add_row("API_KEY", f"{mask_secret(cfg['api_key'])}  [dim]← {source(ENV_API_KEY)}[/dim]")
-    table.add_row("MODEL_NAME", f"{cfg['model_name'] or '(not set)'}  [dim]← {source(ENV_MODEL)}[/dim]")
+    table.add_row(
+        "BASE_URL",
+        f"{cfg['base_url'] or '(not set)'}  [dim]← {source(ENV_BASE_URL)}[/dim]",
+    )
+    table.add_row(
+        "API_KEY",
+        f"{mask_secret(cfg['api_key'])}  [dim]← {source(ENV_API_KEY)}[/dim]",
+    )
+    table.add_row(
+        "MODEL_NAME",
+        f"{cfg['model_name'] or '(not set)'}  [dim]← {source(ENV_MODEL)}[/dim]",
+    )
     table.add_row("MCP", f"{'enabled' if cfg.get('mcp_enabled') else 'disabled'}")
     mcp_servers = load_mcp_config()
     if mcp_servers:
@@ -1678,10 +2170,22 @@ def status(probe: bool) -> None:
 
     problem = check_configured(cfg)
     if problem:
-        console.print(Text(f"⚠ {problem.splitlines()[0]}", style="yellow"))
+        console.print(
+            Panel(
+                f"[yellow]⚠ {problem.splitlines()[0]}[/yellow]",
+                border_style="yellow",
+                box=ROUNDED,
+            )
+        )
         raise SystemExit(1)
 
-    console.print(Text("✓ configuration complete", style="green"))
+    console.print(
+        Panel(
+            "[bold green]✓ configuration complete[/bold green]",
+            box=ROUNDED,
+            border_style="green",
+        )
+    )
     if probe:
         console.print()
         params = _params(cfg)
@@ -1692,8 +2196,13 @@ def status(probe: bool) -> None:
 
 @cli.command()
 @click.option("--raw", is_flag=True, help="Print one model ID per line (for scripts).")
-@click.option("--select", "-s", "do_select", is_flag=True,
-              help="Interactively select a model and save it to config.")
+@click.option(
+    "--select",
+    "-s",
+    "do_select",
+    is_flag=True,
+    help="Interactively select a model and save it to config.",
+)
 def models(raw: bool, do_select: bool) -> None:
     """List the models available from the configured provider.
 
@@ -1739,17 +2248,27 @@ def models(raw: bool, do_select: bool) -> None:
         return
 
     console.print(
-        Text(
-            f"{len(ids)} model(s) available from {cfg['base_url']}",
-            style="bold",
+        Panel(
+            Text(
+                f"{len(ids)} model(s) available from {cfg['base_url']}",
+                style="bold",
+            ),
+            box=ROUNDED,
+            border_style=ACCENT,
         )
     )
     console.print()
-    for model_id in ids:
+    table = Table(box=ROUNDED, border_style=ACCENT, padding=(0, 1))
+    table.add_column("#", style="dim", width=5)
+    table.add_column("Model", style="bold")
+    table.add_column("Current", width=10)
+    for i, model_id in enumerate(ids, 1):
         if model_id == current:
-            console.print(Text(f"✓ {model_id}", style="bold #ff6b00"))
+            # Include checkmark in model name so legacy test "✓ qwen2.5-coder" still passes
+            table.add_row(str(i), f"✓ {model_id}", f"[bold {ACCENT}]current[/bold {ACCENT}]")
         else:
-            console.print(Text(f"  {model_id}"))
+            table.add_row(str(i), model_id, "")
+    console.print(table)
     console.print()
     console.print(
         "[dim]Tip: run `phoenix models --select` to pick a model, or "
@@ -1778,19 +2297,34 @@ def mcp_list() -> None:
     """List configured MCP servers."""
     servers = load_mcp_config()
     if not servers:
-        console.print("[dim]No MCP servers configured.[/dim]")
         console.print(
-            "[dim]Add one with: [bold #ff6b00]phoenix mcp add[/bold #ff6b00][/dim]"
+            Panel(
+                "[dim]No MCP servers configured.[/dim]\n"
+                f"[dim]Add one with: [bold #ff6b00]phoenix mcp add[/bold #ff6b00][/dim]",
+                box=ROUNDED,
+                border_style="bright_black",
+            )
         )
         return
 
     cfg = load_config()
     mcp_enabled = bool(cfg.get("mcp_enabled"))
 
-    console.print("[bold]Configured MCP servers:[/bold]")
+    console.print(
+        Panel(
+            f"[bold]Configured MCP servers ({len(servers)})[/bold]",
+            box=DOUBLE,
+            border_style=ACCENT,
+        )
+    )
     console.print()
-    table = Table(border_style="bright_black", show_header=True, box=None,
-                  header_style="bold")
+    table = Table(
+        box=ROUNDED,
+        border_style=ACCENT,
+        show_header=True,
+        header_style=f"bold {ACCENT}",
+        padding=(0, 1),
+    )
     table.add_column("#", style="dim", width=4)
     table.add_column("Name", style="bold")
     table.add_column("Type")
@@ -1812,10 +2346,16 @@ def mcp_list() -> None:
     console.print(table)
     console.print()
     if mcp_enabled:
-        console.print(Text("✓ MCP is enabled in your config", style="green"))
+        console.print(
+            Panel("✓ MCP is enabled in your config", border_style="green", box=ROUNDED)
+        )
     else:
         console.print(
-            Text("⚠ MCP is disabled — run `phoenix setup` to enable it", style="yellow")
+            Panel(
+                "⚠ MCP is disabled — run `phoenix setup` to enable it",
+                border_style="yellow",
+                box=ROUNDED,
+            )
         )
 
 
@@ -1829,21 +2369,31 @@ def mcp_add() -> None:
     """
     servers = load_mcp_config()
 
-    console.print("[bold]Add MCP server[/bold]")
-    console.print()
-    console.print("[dim]Types:\n"
-                  "  stdio  — local command (e.g. npx, python, node)\n"
-                  "  sse    — remote server URL[/dim]")
+    console.print(
+        Panel(
+            "[bold]Add MCP server[/bold]\n"
+            "[dim]Types:\n"
+            "  stdio  — local command (e.g. npx, python, node)\n"
+            "  sse    — remote server URL[/dim]",
+            box=DOUBLE,
+            border_style=ACCENT,
+            title="🔧 MCP Setup",
+        )
+    )
     console.print()
 
-    transport = click.prompt(
-        "Transport type",
-        type=click.Choice(["stdio", "sse"]),
+    transport = Prompt.ask(
+        f"[bold {ACCENT}]Transport type[/bold {ACCENT}]",
+        choices=["stdio", "sse"],
         default="stdio",
+        console=console,
     )
 
     server: Dict[str, Any] = {}
-    name = click.prompt("Server name (e.g. roblox)").strip()
+    name = Prompt.ask(
+        f"[bold {ACCENT}]Server name[/bold {ACCENT}] [dim](e.g. roblox)[/dim]",
+        console=console,
+    ).strip()
     if not name:
         console.print("[red]Name cannot be empty.[/red]")
         raise SystemExit(1)
@@ -1851,20 +2401,28 @@ def mcp_add() -> None:
 
     if transport == "stdio":
         console.print(
-            "[dim]Examples:\n"
-            "  npx -y @anthropic/mcp-server-roblox\n"
-            "  python /path/to/server.py\n"
-            "  node /path/to/server.js[/dim]"
+            Panel(
+                "[dim]Examples:\n"
+                "  npx -y @anthropic/mcp-server-roblox\n"
+                "  python /path/to/server.py\n"
+                "  node /path/to/server.js[/dim]",
+                box=SQUARE,
+                border_style="bright_black",
+            )
         )
-        cmd_str = click.prompt("Command (space-separated)").strip()
+        cmd_str = Prompt.ask(
+            f"[bold {ACCENT}]Command (space-separated)[/bold {ACCENT}]",
+            console=console,
+        ).strip()
         if not cmd_str:
             console.print("[red]Command cannot be empty.[/red]")
             raise SystemExit(1)
         server["command"] = cmd_str.split()
 
-        env_str = click.prompt(
-            "Environment variables (KEY=VAL,KEY2=VAL2 or empty)",
+        env_str = Prompt.ask(
+            f"[bold {ACCENT}]Environment variables[/bold {ACCENT}] [dim](KEY=VAL,KEY2=VAL2 or empty)[/dim]",
             default="",
+            console=console,
         ).strip()
         if env_str:
             env = {}
@@ -1877,37 +2435,48 @@ def mcp_add() -> None:
                 server["env"] = env
     else:
         console.print(
-            "[dim]Examples:\n"
-            "  https://my-mcp-server.example.com\n"
-            "  http://localhost:3000[/dim]"
+            Panel(
+                "[dim]Examples:\n"
+                "  https://my-mcp-server.example.com\n"
+                "  http://localhost:3000[/dim]",
+                box=SQUARE,
+                border_style="bright_black",
+            )
         )
-        url = click.prompt("Server URL").strip()
+        url = Prompt.ask(
+            f"[bold {ACCENT}]Server URL[/bold {ACCENT}]", console=console
+        ).strip()
         if not url:
             console.print("[red]URL cannot be empty.[/red]")
             raise SystemExit(1)
         server["url"] = url.rstrip("/")
 
-        mcp_key = click.prompt(
-            "API key for MCP server (Enter for none)",
-            default="",
-            hide_input=True,
-        ).strip()
+        mcp_key = _ask_mcp_key_secure()
         if mcp_key:
             server["headers"] = {"Authorization": f"Bearer {mcp_key}"}
 
+    # Append and save — fixed logic, ensures single entry
+    # Remove any existing server with same name to avoid duplicates
+    servers = [s for s in servers if s.get("name") != name]
     servers.append(server)
     path = save_mcp_config(servers)
 
     console.print()
     console.print(
-        Text(f"✓ MCP server '{name}' added", style="bold green")
+        Panel(
+            f"[bold green]✓ MCP server '{name}' added[/bold green]",
+            border_style="green",
+            box=ROUNDED,
+        )
     )
     console.print(f"[dim]Saved to {path}[/dim]")
 
     cfg = load_config()
     if not cfg.get("mcp_enabled"):
         console.print()
-        enable = click.confirm("Enable MCP in your config? (needed to use tools)")
+        enable = Confirm.ask(
+            "Enable MCP in your config? (needed to use tools)", console=console
+        )
         if enable:
             save_config(
                 base_url=cfg["base_url"],
@@ -1915,11 +2484,13 @@ def mcp_add() -> None:
                 model_name=cfg["model_name"],
                 mcp_enabled=True,
             )
-            console.print(Text("✓ MCP enabled", style="bold green"))
+            console.print(
+                Panel("✓ MCP enabled", border_style="green", box=ROUNDED)
+            )
 
     console.print()
     console.print(
-        "[dim]Test with: [bold #ff6b00]phoenix mcp test[/bold #ff6b00][/dim]"
+        f"[dim]Test with: [bold #ff6b00]phoenix mcp test[/bold #ff6b00][/dim]"
     )
 
 
@@ -1938,13 +2509,16 @@ def mcp_remove(name: Optional[str]) -> None:
             console.print(f"  {i}. {srv.get('name', f'server-{i}')}")
         console.print()
         try:
-            idx = click.prompt("Enter number (0 to cancel)", type=int, default=0)
-        except (KeyboardInterrupt, click.Abort):
+            idx = Prompt.ask(
+                "Enter number (0 to cancel)", default="0", console=console
+            )
+            idx_int = int(idx)
+        except (KeyboardInterrupt, EOFError, ValueError):
             return
-        if idx == 0:
+        if idx_int == 0:
             return
-        if 1 <= idx <= len(servers):
-            name = servers[idx - 1].get("name", "")
+        if 1 <= idx_int <= len(servers):
+            name = servers[idx_int - 1].get("name", "")
         else:
             console.print("[red]Invalid number.[/red]")
             return
@@ -1956,7 +2530,13 @@ def mcp_remove(name: Optional[str]) -> None:
         return
 
     save_mcp_config(servers)
-    console.print(Text(f"✓ MCP server '{name}' removed", style="bold green"))
+    console.print(
+        Panel(
+            f"[bold green]✓ MCP server '{name}' removed[/bold green]",
+            border_style="green",
+            box=ROUNDED,
+        )
+    )
 
 
 @mcp_group.command("test")
@@ -1979,7 +2559,7 @@ def mcp_test(name: Optional[str]) -> None:
 
     async def _test_server(srv: Dict[str, Any]) -> None:
         srv_name = srv.get("name", "unnamed")
-        console.print(f"Testing [bold]{srv_name}[/bold]...", end=" ")
+        console.print(f"Testing [bold]{srv_name}[/bold]... ", end="")
         try:
             async with MCPClient.from_config(srv) as client:
                 tools = await client.list_tools()
@@ -2012,9 +2592,20 @@ def mcp_test(name: Optional[str]) -> None:
 @click.argument("prompt", nargs=-1, required=False)
 @click.option("--system", "-s", default=None, help="System prompt for this request.")
 @click.option("--model", "-m", default=None, help="Model override for this request.")
-@click.option("--temperature", "-t", type=float, default=None, help="Sampling temperature.")
-@click.option("--max-tokens", type=click.IntRange(min=1), default=None, help="Cap the reply length.")
-@click.option("--no-stream", is_flag=True, help="Print the reply only when complete (for scripts/pipes).")
+@click.option(
+    "--temperature", "-t", type=float, default=None, help="Sampling temperature."
+)
+@click.option(
+    "--max-tokens",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Cap the reply length.",
+)
+@click.option(
+    "--no-stream",
+    is_flag=True,
+    help="Print the reply only when complete (for scripts/pipes).",
+)
 @click.pass_context
 def ask(
     ctx: click.Context,
@@ -2061,10 +2652,19 @@ def ask(
 
 
 @cli.command()
-@click.option("--system", "-s", default=None, help="System prompt for the conversation.")
+@click.option(
+    "--system", "-s", default=None, help="System prompt for the conversation."
+)
 @click.option("--model", "-m", default=None, help="Model override for this chat.")
-@click.option("--temperature", "-t", type=float, default=None, help="Sampling temperature.")
-@click.option("--max-tokens", type=click.IntRange(min=1), default=None, help="Cap each reply length.")
+@click.option(
+    "--temperature", "-t", type=float, default=None, help="Sampling temperature."
+)
+@click.option(
+    "--max-tokens",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Cap each reply length.",
+)
 @click.pass_context
 def chat(
     ctx: click.Context,
@@ -2091,7 +2691,9 @@ def chat(
         print_error(ConfigurationError(problem))
         raise SystemExit(1)
     raise SystemExit(
-        run_chat(cfg, system=system, model=model, temperature=temperature, max_tokens=max_tokens)
+        run_chat(
+            cfg, system=system, model=model, temperature=temperature, max_tokens=max_tokens
+        )
     )
 
 
