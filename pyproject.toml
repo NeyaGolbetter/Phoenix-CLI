@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phoenix-cli"
+version = "1.0.0"
+description = "A provider-agnostic AI assistant for the terminal (Termux-friendly)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Phoenix CLI contributors" }]
+keywords = ["cli", "ai", "llm", "openai", "ollama", "terminal", "termux"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Android",
+    "Programming Language :: Python :: 3",
+    "Topic :: Terminals",
+]
+
+# Core stack: all pure-Python, no required C compilation (Termux-safe).
+# * httpx   - async HTTP + SSE streaming
+# * rich    - terminal UI, markdown rendering, syntax highlighting
+# * click   - CLI argument parsing
+dependencies = [
+    "httpx>=0.24",
+    "rich>=13.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+# Nicer interactive chat (line editing, history). Pure Python.
+repl = ["prompt_toolkit>=3.0"]
+# Syntax highlighting inside markdown code blocks. Pure Python, needed
+# by rich for `code_theme`. Without it rich still renders code blocks,
+# just un-highlighted.
+highlight = ["pygments>=2.14"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+phoenix = "phoenix_cli.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["phoenix_cli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
