@@ -14,7 +14,8 @@ $ phoenix                            # one command → interactive chat, just ty
 $ phoenix "write a python script"    # one-shot prompt
 $ phoenix setup                      # configure provider + model (interactive picker)
 $ phoenix models --select            # pick a model from a numbered list
-$ phoenix mcp add-roblox             # one-command Roblox MCP setup
+$ phoenix mcp add-roblox             # one-command Roblox Studio MCP setup
+$ phoenix mcp add-roblox-executor    # one-command Roblox *executor* MCP (Delta, in-game)
 $ phoenix status                     # check configuration
 ```
 
@@ -31,12 +32,13 @@ Ctrl+C cancels the in-flight reply.
 1. [Installation](#1-installation)
 2. [Initial setup (the 3-step tutorial)](#2-initial-setup)
 3. [Using models — the interactive picker](#3-using-models--the-interactive-picker)
-4. [MCP setup — Roblox MCP on mobile](#4-mcp-setup--roblox-mcp-on-mobile)
-5. [All 30 chat commands](#5-all-30-chat-commands)
-6. [Single-prompt mode](#6-single-prompt-mode)
-7. [Provider cheat sheet](#7-provider-cheat-sheet)
-8. [Termux tips & troubleshooting](#8-termux-tips--troubleshooting)
-9. [Project layout & development](#9-project-layout--development)
+4. [MCP setup — Roblox Studio MCP](#4-mcp-setup--roblox-studio-mcp)
+5. [Roblox MCP on mobile (executor)](#5-roblox-mcp-on-mobile-executor)
+6. [All 30 chat commands](#6-all-30-chat-commands)
+7. [Single-prompt mode](#7-single-prompt-mode)
+8. [Provider cheat sheet](#8-provider-cheat-sheet)
+9. [Termux tips & troubleshooting](#9-termux-tips--troubleshooting)
+10. [Project layout & development](#10-project-layout--development)
 
 ---
 
@@ -230,10 +232,14 @@ phoenix models          # current model is marked with ✓
 
 ---
 
-## 4. MCP setup — Roblox MCP on mobile
+## 4. MCP setup — Roblox Studio MCP
 
 **MCP (Model Context Protocol)** lets your AI call real tools — create Roblox
 parts, edit scripts, query the workspace, etc. — directly from the chat.
+
+> This section is about **Roblox Studio** (desktop, via the Studio plugin).
+> Want the AI inside the **live game on your phone** (Delta / executor)?
+> Jump to [section 5 — Roblox MCP on mobile (executor)](#5-roblox-mcp-on-mobile-executor).
 
 ### Step 1 — Enable MCP in your config
 
@@ -356,7 +362,163 @@ API key for MCP server: sk-...
 
 ---
 
-## 5. All 30 chat commands
+## 5. Roblox MCP on mobile (executor)
+
+Section 4 connected Phoenix to **Roblox Studio** on the desktop. This section
+is the *other* Roblox MCP: the **`roblox-mcp-server`** package
+("Roblox Executor MCP",
+[`roblox-executor-mcp` on GitLab](https://gitlab.com/DexCodeSX/roblox-executor-mcp))
+— it bridges Phoenix to a **real game client running on your phone**
+(Delta, …) instead of Studio, so the AI can **run Lua in the live game, fire
+remotes, decompile scripts, dump the UI, spy on events**, etc.
+
+This is the same setup many people wire up through a Gemini / Antigravity
+MCP config JSON — Phoenix replicates it with one command, no separate
+config file:
+
+```bash
+phoenix mcp add-roblox-executor
+```
+
+### How the pieces fit
+
+```
+┌────────────── Termux (your phone) ──────────────┐
+│ Phoenix ──stdio──> roblox-mcp (MCP server)      │
+│                       │ HTTP + WebSocket :16384 │
+│                       ▼                         │
+│           in-game connector (loadstring         │
+│           pasted into Delta, inside Roblox)     │
+└─────────────────────────────────────────────────┘
+```
+
+* Phoenix spawns `roblox-mcp` as a **stdio** MCP server — the existing
+  Phoenix MCP transport handles it, nothing new to configure.
+* The server *also* listens on `http://localhost:16384` (HTTP + WebSocket,
+  with an HTTP-poll fallback). That part is internal: it's how the
+  in-game connector talks to the server.
+* The **connector** is a small script you load into your executor with a
+  loadstring printed by `roblox loader`. Once it says *connected* in game,
+  the AI's tool calls run in the live session.
+
+### Step 1 — Install the pieces in Termux
+
+```bash
+pkg update && pkg upgrade -y
+pkg install nodejs git cloudflared termux-api tmux -y
+npm install -g roblox-mcp-server
+```
+
+`npm install -g` gives you two commands: `roblox-mcp` (the MCP server) and
+`roblox` (its helper CLI — `status`, `loader`, `exec`, …).
+
+### Step 2 — One command in Phoenix
+
+```bash
+$ phoenix mcp add-roblox-executor
+
+✓ MCP server 'roblox-executor' added
+✓ MCP enabled
+```
+
+The preset finds the binary in this order: the `roblox-mcp` command on
+PATH → the global npm install (`node …/roblox-mcp-server/dist/index.js`,
+including the Termux path
+`/data/data/com.termux/files/usr/lib/node_modules/roblox-mcp-server/dist/index.js`)
+→ falls back to `npx -y roblox-mcp-server` (downloads on first run). If the
+package isn't installed yet it **still writes the config** and prints the
+exact install steps above — it starts working the moment you install it.
+
+### Step 3 — Run the server + tunnel (the 3 tmux sessions)
+
+```bash
+tmux                                        # session 1 (Ctrl+B, C for new ones)
+roblox-mcp                                  # MCP server, listens on :16384
+
+# session 2 — expose :16384 to the game:
+cloudflared tunnel --url http://localhost:16384
+# → note the https://<something>.trycloudflare.com URL it prints
+
+# session 3 — print the connector loadstring (bake in the tunnel URL):
+roblox loader --baseurl https://<something>.trycloudflare.com -c
+```
+
+`-c` copies the loadstring to the Termux clipboard (`termux-clipboard-set`;
+drop `-c` to just print it). Paste it into your executor (Delta) and **run
+it while you're in a game** — the in-game bridge shows *connected* when it
+reaches the server.
+
+> ⚠️ **Android quirk — the tunnel is needed even on ONE phone.** Roblox runs
+> in its own network sandbox and **cannot reach Termux's
+> `localhost:16384`** (the connector UI actually refuses localhost on
+> mobile). So on a phone you always need the `cloudflared` step above, same
+> phone or not. On desktop (Windows/macOS/Linux) the executor *is* a local
+> process and plain `localhost:16384` works — no tunnel, and
+> `roblox loader` alone is enough.
+
+### Step 4 — Test and chat
+
+```bash
+$ phoenix mcp test roblox-executor
+
+Testing roblox-executor... ✓ connected — 100+ tool(s)
+    🔧 run Luau code — Execute Luau source in the game client
+    🔧 decompile script — Decompile a script's source
+    🔧 fire remote — Fire a RemoteEvent / RemoteFunction
+    ...
+```
+
+The first test may take a few minutes when the npx fallback is used (the
+package downloads on first run). Then just chat:
+
+```
+phoenix ❯ print all player names in the game, then decompile the
+          script in Workspace.NPC
+  🔧 Calling mcp__roblox-executor__run-Luau-code...
+  ...
+```
+
+### Cross-device setups (--baseurl)
+
+If **Phoenix runs on another device** from the Termux server (laptop ↔
+phone), give the spawned server the tunnel URL so it relays to the remote
+primary instead of binding its own port:
+
+```bash
+phoenix mcp add-roblox-executor --baseurl https://<something>.trycloudflare.com
+```
+
+That writes `--baseurl <url>` into the server's command and exports
+`ROBLOX_MCP_URL` **and** `BASE_URL` into its environment. Which env var
+matters?
+
+| Knob | Read by | Notes |
+| --- | --- | --- |
+| `--baseurl` (argument) | the server itself | runs it in **secondary relay** mode against the remote primary — this is the functional switch for remote setups |
+| `$ROBLOX_MCP_URL` (env) | the `roblox` helper CLI (`loader`, `status`, `exec`, …) | makes `roblox loader` bake the right URL into the loadstring |
+| `$BASE_URL` (env) | **nothing** in v3.8.4 | kept in the preset for configs copied from other AI clients; it is silently ignored by the server |
+
+So if you configure things by hand, use the `--baseurl` argument for the
+server and `$ROBLOX_MCP_URL` for the `roblox` CLI.
+
+### Managing the executor server
+
+```bash
+phoenix mcp test roblox-executor   # test one server
+phoenix mcp remove roblox-executor # remove it
+phoenix status                     # shows whether MCP is enabled
+roblox status                      # is the Termux server up? clients?
+roblox exec 'print("hi")'          # run Lua directly from Termux (no AI)
+```
+
+> 🔐 **Security:** this server allows arbitrary code execution in your game
+> and has **no authentication**. A `trycloudflare.com` URL is public —
+> anyone who guesses it can run Lua in your session. Restart `cloudflared`
+> (fresh random URL) when you're done, and don't share the link.
+
+---
+
+## 6. All 30 chat commands
 
 Start a chat session with `phoenix` (or `phoenix chat`), then use these commands. Every
 command starts with `/`. Type `/help` at any time to see them all.
@@ -431,7 +593,7 @@ copy manually.
 
 ---
 
-## 6. Single-prompt mode
+## 7. Single-prompt mode
 
 For scripts, pipes, and quick questions:
 
@@ -455,7 +617,7 @@ Options:
 
 ---
 
-## 7. Provider cheat sheet
+## 8. Provider cheat sheet
 
 | Provider                | BASE_URL                              | API key needed? |
 |-------------------------|---------------------------------------|-----------------|
@@ -480,7 +642,7 @@ Options:
 
 ---
 
-## 8. Termux tips & troubleshooting
+## 9. Termux tips & troubleshooting
 
 - **Ctrl key**: Termux puts `CTRL` on the extra-keys row above the keyboard
   (swipe it if hidden), or use volume-down button binding
@@ -507,11 +669,14 @@ Options:
   Termux only if you run long unattended generations.
 - **Roblox MCP**: the server runs as a child process inside Termux. Make sure
   Node.js (`pkg install nodejs`) and the MCP package are installed. Check
-  with `phoenix mcp test` before chatting.
+  with `phoenix mcp test` before chatting. For the *executor* MCP
+  (`roblox-mcp-server` + Delta), remember Android can't reach Termux's
+  localhost — the in-game connector needs the `cloudflared` tunnel (see
+  section 5).
 
 ---
 
-## 9. Project layout & development
+## 10. Project layout & development
 
 ```
 phoenix_cli/

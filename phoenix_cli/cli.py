@@ -2371,7 +2371,9 @@ def _print_dashboard() -> None:
         f"  [bold #ff6b00]phoenix setup[/bold #ff6b00]            configure provider + model\n"
         f"  [bold #ff6b00]phoenix status[/bold #ff6b00]           show current configuration\n"
         f"  [bold #ff6b00]phoenix models --select[/bold #ff6b00]  pick model from list\n"
-        f"  [bold #ff6b00]phoenix mcp add-roblox[/bold #ff6b00]   one-command Roblox MCP",
+        f"  [bold #ff6b00]phoenix mcp add-roblox[/bold #ff6b00]   one-command Roblox MCP\n"
+        f"  [bold #ff6b00]phoenix mcp add-roblox-executor[/bold #ff6b00]\n"
+        f"                     Roblox executor MCP (Delta, in-game)",
         box=ROUNDED,
         border_style=ACCENT,
         title=f"[bold]Quick start[/bold]",
@@ -3093,6 +3095,255 @@ def mcp_add_roblox() -> None:
     console.print(
         "[dim]Tip: the first `phoenix mcp test` may take a while — npx downloads "
         "the package on first run.[/dim]"
+    )
+
+
+# The Roblox *executor* MCP preset — the other Roblox MCP. This is the
+# `roblox-mcp-server` package ("Roblox Executor MCP", DexCodeSX fork,
+# https://gitlab.com/DexCodeSX/roblox-executor-mcp). It bridges an MCP
+# client (Phoenix, over stdio) to a real game client — Delta, Synapse, …
+# — running inside Roblox: the server also serves HTTP+WebSocket on
+# http://localhost:16384 for the in-game connector, which you load via an
+# executor loadstring printed by `roblox loader`.
+ROBLOX_EXECUTOR_NAME = "roblox-executor"
+ROBLOX_EXECUTOR_NPX_COMMAND = ["npx", "-y", "roblox-mcp-server"]
+
+# Where `npm install -g roblox-mcp-server` puts the entry point on Termux
+# (the postinstall prints this exact path). Used as a fallback when the
+# `roblox-mcp` bin is not on PATH but the package is installed globally.
+TERMUX_GLOBAL_EXECUTOR_ENTRY = (
+    "/data/data/com.termux/files/usr/lib/node_modules/"
+    "roblox-mcp-server/dist/index.js"
+)
+
+
+def _npm_global_root() -> Optional[Path]:
+    """Return the global node_modules directory, or ``None``.
+
+    Never raises — any failure (npm missing, slow spawn, weird output)
+    just means "no global root known".
+    """
+    npm = shutil.which("npm")
+    if not npm:
+        return None
+    try:
+        proc = subprocess.run(
+            [npm, "root", "-g"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None
+    # `npm root -g` prints one path (be defensive about extra lines).
+    return Path(out.splitlines()[-1].strip())
+
+
+def _locate_roblox_mcp() -> tuple[List[str], str]:
+    """Find the best command to spawn the ``roblox-mcp`` stdio server.
+
+    Returns ``(command, how)`` where ``how`` is one of:
+
+    * ``"binary"`` — the ``roblox-mcp`` executable is on PATH (best);
+    * ``"global"`` — a global ``npm install -g roblox-mcp-server`` was
+      found; spawn ``node <...>/dist/index.js`` directly;
+    * ``"npx"`` — nothing installed locally; fall back to
+      ``npx -y roblox-mcp-server``, which downloads the package on first
+      run (the first ``phoenix mcp test`` may take a few minutes).
+    """
+    binary = shutil.which("roblox-mcp")
+    if binary:
+        return [binary], "binary"
+
+    candidates: List[Path] = []
+    npm_root = _npm_global_root()
+    if npm_root:
+        candidates.append(npm_root / "roblox-mcp-server" / "dist" / "index.js")
+    candidates.append(Path(TERMUX_GLOBAL_EXECUTOR_ENTRY))
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return ["node", str(candidate)], "global"
+        except OSError:
+            continue
+
+    return list(ROBLOX_EXECUTOR_NPX_COMMAND), "npx"
+
+
+@mcp_group.command("add-roblox-executor")
+@click.option(
+    "--baseurl",
+    "--url",
+    "baseurl",
+    default=None,
+    metavar="URL",
+    help=(
+        "Public URL of the MCP server's HTTP bridge when the executor or "
+        "the AI lives on another device (e.g. a cloudflared tunnel URL). "
+        "Passed to the server as its --baseurl argument (secondary relay "
+        "mode) and exported as ROBLOX_MCP_URL / BASE_URL."
+    ),
+)
+def mcp_add_roblox_executor(baseurl: Optional[str]) -> None:
+    """Add the Roblox *executor* MCP server (Delta / in-game bridge).
+
+    Writes a stdio entry that spawns `roblox-mcp` (the `roblox-mcp-server`
+    package), enables MCP, and prints the phone-side steps: start the
+    server, tunnel it, load the connector with `roblox loader`.
+
+    Use --baseurl when the executor (or Phoenix) runs on another device —
+    e.g. the https://*.trycloudflare.com URL printed by
+    `cloudflared tunnel --url http://localhost:16384`.
+    """
+    servers = load_mcp_config()
+    command, how = _locate_roblox_mcp()
+    name = ROBLOX_EXECUTOR_NAME
+
+    display_cmd = " ".join(command + (["--baseurl", baseurl] if baseurl else []))
+    console.print(
+        Panel(
+            f"[bold]Adding Roblox executor MCP server[/bold]\n"
+            f"[dim]Command:[/dim] [cyan]{display_cmd}[/cyan]\n\n"
+            f"[dim]Prerequisites:[/dim]\n"
+            f"  • Node.js 18+ (Termux: [bold]pkg install nodejs[/bold])\n"
+            f"  • [bold]npm install -g roblox-mcp-server[/bold] (the MCP "
+            f"server + `roblox` CLI)\n"
+            f"  • Roblox executor (Delta, …) running the in-game connector",
+            box=DOUBLE,
+            border_style=ACCENT,
+            title="🎮 Roblox executor MCP",
+        )
+    )
+    console.print()
+
+    if how == "npx":
+        # Package not installed — do not fail silently: explain exactly how
+        # to install it, but still write the config (the npx fallback works
+        # once Node is present, it just downloads on first use).
+        console.print(
+            Panel(
+                "[yellow]⚠ `roblox-mcp` is not installed on this device.[/yellow]\n"
+                "The config was written anyway — it will work as soon as the\n"
+                "package is installed. Exact Termux steps:\n\n"
+                f"  [bold]pkg install nodejs[/bold]\n"
+                f"  [bold]npm install -g roblox-mcp-server[/bold]\n\n"
+                f"[dim]Until then the written command uses npx, which downloads\n"
+                f"the package on first run — the first `phoenix mcp test` may\n"
+                f"take a few minutes on mobile data.[/dim]",
+                border_style="yellow",
+                box=ROUNDED,
+                title="📦 Package not found",
+            )
+        )
+        console.print()
+
+    entry: Dict[str, Any] = {"name": name, "command": list(command)}
+    if baseurl:
+        # Relay mode: the spawned server connects to a remote primary (e.g.
+        # the Termux box behind a cloudflared tunnel) instead of binding its
+        # own :16384. Only the --baseurl *argument* is read by the server
+        # itself; ROBLOX_MCP_URL is the env var its `roblox` CLI honors and
+        # BASE_URL is kept for configs copied from other AI clients (those
+        # ignore it, so we export it here but it is a no-op).
+        entry["command"] = list(command) + ["--baseurl", baseurl]
+        entry["env"] = {
+            "ROBLOX_MCP_URL": baseurl,
+            "BASE_URL": baseurl,
+        }
+
+    # Replace any existing entry with the same name to avoid duplicates.
+    servers = [s for s in servers if s.get("name") != name]
+    servers.append(entry)
+    path = save_mcp_config(servers)
+    console.print(
+        Panel(
+            f"[bold green]✓ MCP server '{name}' added[/bold green]\n"
+            f"[dim]Command: {' '.join(entry['command'])}[/dim]",
+            border_style="green",
+            box=ROUNDED,
+        )
+    )
+    console.print(f"[dim]Saved to {path}[/dim]")
+
+    # Enable MCP without asking — the whole point of the preset is a
+    # one-command phone setup.
+    cfg = load_config()
+    if not cfg.get("mcp_enabled"):
+        if cfg.get("base_url") and cfg.get("model_name"):
+            save_config(
+                base_url=cfg["base_url"],
+                api_key=cfg.get("api_key", ""),
+                model_name=cfg["model_name"],
+                mcp_enabled=True,
+            )
+            console.print(Panel("✓ MCP enabled", border_style="green", box=ROUNDED))
+        else:
+            console.print(
+                Panel(
+                    "[yellow]⚠ MCP tools are still off — run `phoenix setup` "
+                    "first (answer 'y' to MCP), then rerun this "
+                    "command or flip \"mcp_enabled\" in the config.[/yellow]",
+                    border_style="yellow",
+                    box=ROUNDED,
+                )
+            )
+
+    console.print()
+    tunnel_hint = (
+        "cloudflared tunnel --url http://localhost:16384"
+        if not baseurl
+        else f"(reusing your --baseurl: {baseurl})"
+    )
+    console.print(
+        Panel(
+            "[bold]Next steps — on the phone running the executor:[/bold]\n\n"
+            "[bold]1.[/bold] Termux session 1 — start the MCP server\n"
+            "     (it listens on :16384):\n"
+            "     [bold #ff6b00]roblox-mcp[/bold #ff6b00]\n\n"
+            "[bold]2.[/bold] Termux session 2 — expose it to the game.\n"
+            "     Required on Android: the Roblox app can't see Termux's\n"
+            "     localhost (desktop executors can skip this):\n"
+            f"     [bold #ff6b00]{tunnel_hint}[/bold #ff6b00]\n\n"
+            "[bold]3.[/bold] Termux session 3 — copy the connector\n"
+            "     loadstring into your executor (Delta):\n"
+            "     [bold #ff6b00]roblox loader -c[/bold #ff6b00]\n"
+            "     [dim](-c copies via termux-clipboard-set; drop -c to print)[/dim]\n"
+            "     With a tunnel, bake the public URL into the snippet:\n"
+            "     [bold #ff6b00]roblox loader --baseurl\n"
+            "     https://<tunnel>.trycloudflare.com -c[/bold #ff6b00]\n"
+            "     Paste it into Delta and run it — the in-game bridge\n"
+            "     says [green]connected[/green] when it reaches the server.\n\n"
+            "[bold]4.[/bold] Back in Phoenix:\n"
+            "     [bold #ff6b00]phoenix mcp test "
+            f"{name}[/bold #ff6b00]\n"
+            "     then just chat — e.g. \"run print('hello from phoenix')\n"
+            "     in the game\".\n\n"
+            "[dim]Notes:\n"
+            "  • Executor on the SAME Android phone? You still need the\n"
+            "    cloudflared tunnel (see step 2).\n"
+            "  • Phoenix on another device? Rerun with\n"
+            "    --baseurl <tunnel-url> so this spawned server relays to\n"
+            "    the remote primary.\n"
+            "  • The written env exports ROBLOX_MCP_URL (read by the\n"
+            "    `roblox` CLI) and BASE_URL (kept for configs copied from\n"
+            "    other AI clients — the server itself only reads the\n"
+            "    --baseurl argument).\n"
+            "  • The tunnel URL is public and the server has no auth —\n"
+            "    anyone with the link can run Lua in your game.[/dim]",
+            box=DOUBLE,
+            border_style=ACCENT,
+            title="📱 Phone setup",
+        )
+    )
+    console.print()
+    console.print(
+        "[dim]Test with: [bold #ff6b00]phoenix mcp test "
+        f"{name}[/bold #ff6b00][/dim]"
     )
 
 
