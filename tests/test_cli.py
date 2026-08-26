@@ -691,3 +691,150 @@ def test_mcp_add_roblox_replaces_existing_entry(tmp_path, monkeypatch):
     servers = load_mcp_config()
     assert len(servers) == 1
     assert servers[0]["command"][-1] == "robloxstudio-mcp@latest"
+
+
+# ---------------------------------------------------------------------------
+# Roblox executor MCP preset (`phoenix mcp add-roblox-executor`)
+# ---------------------------------------------------------------------------
+
+
+def _patch_executor_locate(monkeypatch, command, how):
+    """Force `phoenix mcp add-roblox-executor` to see a specific binary."""
+    import phoenix_cli.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_locate_roblox_mcp", lambda: (list(command), how))
+
+
+def test_mcp_add_roblox_executor_writes_config(tmp_path, monkeypatch, clean_env):
+    """Binary present: preset writes the stdio entry and enables MCP."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _patch_executor_locate(
+        monkeypatch, ["/data/data/com.termux/files/usr/bin/roblox-mcp"], "binary"
+    )
+    from phoenix_cli.cli import ROBLOX_EXECUTOR_NAME
+    from phoenix_cli.config import load_config
+    from phoenix_cli.mcp import load_mcp_config
+
+    # A configured provider so the preset can auto-enable MCP.
+    save_config("http://localhost:11434", "", "llama3", mcp_enabled=False)
+
+    result = CliRunner().invoke(cli, ["mcp", "add-roblox-executor"])
+    assert result.exit_code == 0, result.output
+    assert "roblox loader" in result.output      # next-steps guidance
+    assert "cloudflared" in result.output        # tunnel guidance
+    assert "not installed" not in result.output  # binary was found
+
+    servers = load_mcp_config()
+    assert len(servers) == 1
+    assert servers[0]["name"] == ROBLOX_EXECUTOR_NAME
+    assert servers[0]["command"] == [
+        "/data/data/com.termux/files/usr/bin/roblox-mcp"
+    ]
+    assert "env" not in servers[0]  # no --baseurl → no env passthrough
+
+    # MCP must be enabled in the main config.
+    assert load_config()["mcp_enabled"] is True
+
+
+def test_mcp_add_roblox_executor_missing_binary_guidance(tmp_path, monkeypatch):
+    """Binary missing: exact Termux install steps + config written anyway."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _patch_executor_locate(monkeypatch, ["npx", "-y", "roblox-mcp-server"], "npx")
+    from phoenix_cli.cli import ROBLOX_EXECUTOR_NPX_COMMAND
+    from phoenix_cli.mcp import load_mcp_config
+
+    result = CliRunner().invoke(cli, ["mcp", "add-roblox-executor"])
+    assert result.exit_code == 0, result.output
+    # The exact install steps must be printed (never fail silently).
+    assert "pkg install nodejs" in result.output
+    assert "npm install -g roblox-mcp-server" in result.output
+
+    servers = load_mcp_config()
+    assert len(servers) == 1
+    assert servers[0]["name"] == "roblox-executor"
+    assert servers[0]["command"] == ROBLOX_EXECUTOR_NPX_COMMAND
+
+
+def test_mcp_add_roblox_executor_baseurl_writes_env(tmp_path, monkeypatch):
+    """--baseurl: relay arg + both env names (ROBLOX_MCP_URL / BASE_URL)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _patch_executor_locate(monkeypatch, ["roblox-mcp"], "binary")
+    from phoenix_cli.mcp import load_mcp_config
+
+    url = "https://example-tunnel.trycloudflare.com"
+    result = CliRunner().invoke(cli, ["mcp", "add-roblox-executor", "--baseurl", url])
+    assert result.exit_code == 0, result.output
+
+    servers = load_mcp_config()
+    assert len(servers) == 1
+    entry = servers[0]
+    assert entry["command"] == ["roblox-mcp", "--baseurl", url]
+    # Both env names are written: ROBLOX_MCP_URL is what the server's own
+    # `roblox` CLI honors; BASE_URL is kept for configs copied from other
+    # AI clients (the server itself only reads the --baseurl argument).
+    assert entry["env"] == {"ROBLOX_MCP_URL": url, "BASE_URL": url}
+
+
+def test_mcp_add_roblox_executor_replaces_existing_entry(tmp_path, monkeypatch):
+    """Rerunning the preset replaces the old entry instead of duplicating."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _patch_executor_locate(monkeypatch, ["roblox-mcp"], "binary")
+    from phoenix_cli.mcp import load_mcp_config, save_mcp_config
+
+    save_mcp_config(
+        [{"name": "roblox-executor", "command": ["npx", "stale-old-command"]}]
+    )
+    result = CliRunner().invoke(cli, ["mcp", "add-roblox-executor"])
+    assert result.exit_code == 0, result.output
+
+    servers = load_mcp_config()
+    assert len(servers) == 1
+    assert servers[0]["command"] == ["roblox-mcp"]
+
+    # A second run must not duplicate either.
+    result = CliRunner().invoke(cli, ["mcp", "add-roblox-executor"])
+    assert result.exit_code == 0, result.output
+    assert len(load_mcp_config()) == 1
+
+
+def test_mcp_add_roblox_executor_keeps_other_servers(tmp_path, monkeypatch):
+    """The preset must not touch unrelated servers in the MCP config."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _patch_executor_locate(monkeypatch, ["roblox-mcp"], "binary")
+    from phoenix_cli.mcp import load_mcp_config, save_mcp_config
+
+    save_mcp_config([{"name": "remote", "url": "https://mcp.example.com"}])
+    result = CliRunner().invoke(cli, ["mcp", "add-roblox-executor"])
+    assert result.exit_code == 0, result.output
+
+    servers = load_mcp_config()
+    assert len(servers) == 2
+    names = {s["name"] for s in servers}
+    assert names == {"remote", "roblox-executor"}
+
+
+def test_locate_roblox_mcp_falls_back_to_npx(tmp_path, monkeypatch):
+    """Nothing installed → the documented npx fallback command."""
+    import phoenix_cli.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        cli_mod, "TERMUX_GLOBAL_EXECUTOR_ENTRY", str(tmp_path / "nope" / "index.js")
+    )
+    cmd, how = cli_mod._locate_roblox_mcp()
+    assert how == "npx"
+    assert cmd == cli_mod.ROBLOX_EXECUTOR_NPX_COMMAND
+
+
+def test_locate_roblox_mcp_finds_global_install(tmp_path, monkeypatch):
+    """Global npm install (Termux path) → spawned via `node <entry>`."""
+    import phoenix_cli.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
+    entry = tmp_path / "usr" / "lib" / "node_modules" / "roblox-mcp-server" / "dist" / "index.js"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    monkeypatch.setattr(cli_mod, "TERMUX_GLOBAL_EXECUTOR_ENTRY", str(entry))
+    cmd, how = cli_mod._locate_roblox_mcp()
+    assert how == "global"
+    assert cmd == ["node", str(entry)]
