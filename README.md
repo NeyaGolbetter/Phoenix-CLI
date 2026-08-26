@@ -1,22 +1,28 @@
-# 🔥 Phoenix CLI
+# 🔥 PHOENIX — Rise. Chat. Create.
 
 **AI that rises with you.** A provider-agnostic AI assistant for the terminal —
 built to run beautifully on Termux, desktop Linux, macOS, and WSL.
 
-Phoenix CLI talks the **OpenAI-compatible API** format. Plug in *any* provider —
+Phoenix talks the **OpenAI-compatible API** format. Plug in *any* provider —
 **Ollama, LM Studio, vLLM, llama.cpp, OpenRouter, Together AI, Groq, DeepSeek,
 Mistral, Fireworks, xAI, LocalAI** — configure it once, and chat from anywhere,
 including your Android phone. Supports **MCP (Model Context Protocol)** so your
 AI can use tools like the **Roblox MCP server** to build games from the terminal.
 
 ```
-$ phoenix "write a python script that prints prime numbers"
-$ phoenix chat                     # interactive chat with 30 slash commands
-$ phoenix setup                    # configure provider + model (interactive picker)
-$ phoenix models --select          # pick a model from a numbered list
-$ phoenix mcp add                  # connect a Roblox MCP server
-$ phoenix status                   # check configuration
+$ phoenix                            # one command → interactive chat, just type
+$ phoenix "write a python script"    # one-shot prompt
+$ phoenix setup                      # configure provider + model (interactive picker)
+$ phoenix models --select            # pick a model from a numbered list
+$ phoenix mcp add-roblox             # one-command Roblox MCP setup
+$ phoenix status                     # check configuration
 ```
+
+Running bare `phoenix` drops you straight into chat — **no commands needed**.
+Type messages freely until you type `/exit` (or press Ctrl+D). Slash commands
+(`/help`, `/model`, `/save`, …) are entirely optional. You can even keep typing
+while a reply is still streaming — input is buffered and sent in order, and
+Ctrl+C cancels the in-flight reply.
 
 ---
 
@@ -128,7 +134,7 @@ Enable MCP (Model Context Protocol) tools? (for Roblox MCP etc.) [y/N]: n
 │  MCP          disabled                             │
 ╰──────────────────────────────────────────────────╯
 
-Next: try phoenix "hello!" or start a conversation with phoenix chat
+Next: run `phoenix` to start chatting, or try phoenix "hello!" for a one-shot
 ```
 
 ### What happens under the hood
@@ -244,7 +250,7 @@ Or toggle it later:
 
 ### Step 2 — Install Node.js (Termux)
 
-Most Roblox MCP servers run on Node.js.
+The Roblox MCP server runs on Node.js.
 
 ```bash
 pkg install nodejs
@@ -252,56 +258,66 @@ pkg install nodejs
 
 ### Step 3 — Add your Roblox MCP server
 
+The easiest way is the one-command preset:
+
 ```bash
-$ phoenix mcp add
-
-Add MCP server
-Types:
-  stdio  — local command (e.g. npx, python, node)
-  sse    — remote server URL
-
-Transport type [stdio]: stdio
-Server name: roblox
-Command: npx -y @anthropic/mcp-server-roblox
-Environment variables: ROBLOX_API_KEY=your-key-here
-
-✓ MCP server 'roblox' added
-Saved to /data/data/com.termux/files/home/.phoenix_mcp.json
-Enable MCP in your config? (needed to use tools) [Y/n]: Y
-✓ MCP enabled
+$ phoenix mcp add-roblox
 ```
 
-That creates `~/.phoenix_mcp.json`:
+It writes the correct command to `~/.phoenix_mcp.json` (and enables MCP if
+needed):
 
 ```json
 {
   "servers": [
     {
       "name": "roblox",
-      "command": ["npx", "-y", "@anthropic/mcp-server-roblox"],
-      "env": { "ROBLOX_API_KEY": "your-key-here" }
+      "command": ["npx", "-y", "robloxstudio-mcp@latest"]
     }
   ]
 }
 ```
+
+> ⚠️ **Note:** older releases of this README used
+> `npx -y @anthropic/mcp-server-roblox` — **that package does not exist on
+> npm**, which is exactly why the server never connected. The preset uses the
+> real, actively maintained `robloxstudio-mcp` package instead (a drop-in
+> replacement with 50+ Studio tools). You can also add it manually with
+> `phoenix mcp add` (transport `stdio`, command
+> `npx -y robloxstudio-mcp@latest`).
+
+`robloxstudio-mcp` bridges to **Roblox Studio through a local plugin**:
+
+1. install the plugin from the
+   [`robloxstudio-mcp` README](https://github.com/drgost1/robloxstudio-mcp)
+   into Studio;
+2. keep Roblox Studio open while chatting — the plugin shows
+   **"Connected"** when the bridge is ready.
+
+No API keys are required. The first `phoenix mcp test` may take a moment
+while npx downloads the package.
 
 ### Step 4 — Test the connection
 
 ```bash
 $ phoenix mcp test
 
-Testing roblox... ✓ connected — 12 tool(s)
-    🔧 create_part — Create a new part in the workspace
-    🔧 edit_script — Edit a script attached to a part
-    🔧 get_hierarchy — List the workspace hierarchy
-    🔧 set_property — Set a property on an instance
-    ... and 8 more
+Testing roblox... ✓ connected — 51 tool(s)
+    🔧 create_object — Create a new instance
+    🔧 get_file_tree — Browse the instance hierarchy as a tree
+    🔧 edit_script — Edit a script in Studio
+    🔧 set_property — Set any property on an instance
+    ... and 47 more
 ```
+
+If a server can't connect, Phoenix now prints the server's actual error
+output (e.g. a missing npm package or a crashed process) instead of hanging
+silently — `phoenix mcp test` is the fastest way to diagnose it.
 
 ### Step 5 — Chat with MCP tools enabled
 
 ```bash
-$ phoenix chat
+$ phoenix
 
 Model: gpt-4o-mini
 API:   http://myserver.example.com:8080/v1
@@ -342,7 +358,7 @@ API key for MCP server: sk-...
 
 ## 5. All 30 chat commands
 
-Start a chat session with `phoenix chat`, then use these commands. Every
+Start a chat session with `phoenix` (or `phoenix chat`), then use these commands. Every
 command starts with `/`. Type `/help` at any time to see them all.
 
 | # | Command | What it does |

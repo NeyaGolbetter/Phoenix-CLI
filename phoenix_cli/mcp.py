@@ -26,6 +26,7 @@ straight through to ``PhoenixClient.chat_stream``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -117,7 +118,19 @@ def _rpc_notification(method: str, params: Any = None) -> Dict[str, Any]:
 
 
 class _StdioTransport:
-    """Talk JSON-RPC with a subprocess over stdin/stdout."""
+    """Talk JSON-RPC with a subprocess over stdin/stdout.
+
+    Robustness notes:
+
+    * the server's **stderr** is captured and surfaced in error messages, so
+      a misconfigured command (missing package, bad npx argument, …) fails
+      with the real reason instead of a silent 60-second hang;
+    * if the server process **exits early**, every in-flight request fails
+      immediately with the captured stderr;
+    * requests have a timeout so a hung server can never freeze the CLI.
+    """
+
+    DEFAULT_REQUEST_TIMEOUT = 90.0
 
     def __init__(self, command: Sequence[str], env: Optional[Dict[str, str]] = None,
                  cwd: Optional[str] = None) -> None:
@@ -127,6 +140,9 @@ class _StdioTransport:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._pending: Dict[int, asyncio.Future] = {}
         self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._exit_task: Optional[asyncio.Task] = None
+        self._stderr_tail = ""
         self._next_id: int = 1
 
     async def start(self) -> None:
@@ -152,22 +168,30 @@ class _StdioTransport:
                 f"Could not start MCP server: {exc}"
             ) from exc
         self._reader_task = asyncio.create_task(self._read_loop())
+        self._stderr_task = asyncio.create_task(self._stderr_loop())
+        self._exit_task = asyncio.create_task(self._watch_exit())
 
     async def stop(self) -> None:
-        if self._reader_task:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        for task in (self._reader_task, self._stderr_task, self._exit_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._reader_task = self._stderr_task = self._exit_task = None
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 self._proc.kill()
+                with contextlib.suppress(Exception):
+                    await self._proc.wait()
 
-    async def send_request(self, method: str, params: Any = None) -> Any:
+    async def send_request(
+        self, method: str, params: Any = None, timeout: Optional[float] = None
+    ) -> Any:
         if not self._proc or not self._proc.stdin or not self._proc.stdout:
             raise MCPConnectionError("Transport not started")
         req_id = self._next_id
@@ -179,7 +203,17 @@ class _StdioTransport:
         data = json.dumps(msg) + "\n"
         self._proc.stdin.write(data.encode())
         await self._proc.stdin.drain()
-        return await asyncio.wait_for(fut, timeout=60)
+        try:
+            return await asyncio.wait_for(
+                fut, timeout=self.DEFAULT_REQUEST_TIMEOUT if timeout is None else timeout
+            )
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(req_id, None)
+            raise MCPConnectionError(
+                f"MCP server {self._command[0]!r} did not answer '{method}' "
+                f"in time. It may still be downloading its package (npx) or "
+                "it may be hung. Check `phoenix mcp test`."
+            ) from exc
 
     async def send_notification(self, method: str, params: Any = None) -> None:
         if not self._proc or not self._proc.stdin:
@@ -221,6 +255,42 @@ class _StdioTransport:
         except Exception:
             pass
 
+    async def _stderr_loop(self) -> None:
+        assert self._proc and self._proc.stderr
+        try:
+            while True:
+                line = await self._proc.stderr.readline()
+                if not line:
+                    break
+                self._stderr_tail = (
+                    self._stderr_tail + line.decode(errors="replace")
+                )[-4000:]
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def _watch_exit(self) -> None:
+        """Fail every pending request the moment the server process dies."""
+        if not self._proc:
+            return
+        try:
+            code = await self._proc.wait()
+        except asyncio.CancelledError:
+            return
+        if not self._pending:
+            return
+        detail = self._stderr_tail.strip() or "(no output)"
+        err = MCPConnectionError(
+            f"MCP server {self._command[0]!r} exited before answering "
+            f"(exit code {code}).\n"
+            f"stderr: {detail}"
+        )
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(err)
+        self._pending.clear()
+
 
 # ---------------------------------------------------------------------------
 # SSE transport
@@ -228,7 +298,22 @@ class _StdioTransport:
 
 
 class _SSETransport:
-    """Talk JSON-RPC with a remote MCP server over HTTP + SSE."""
+    """Talk JSON-RPC with a remote MCP server over HTTP + SSE.
+
+    One SSE stream is opened once and kept alive for the whole session:
+
+    * the server announces its message endpoint with an ``endpoint`` event
+      on that stream;
+    * responses to our POSTs arrive as ``message`` events on the *same*
+      stream.
+
+    Keeping the original stream open matters: MCP SSE servers commonly tie
+    the message endpoint to a session created by the initial ``GET /sse``.
+    Closing that stream and reopening it would create a new session whose
+    message endpoint no longer accepts the old session's POSTs.
+    """
+
+    ENDPOINT_TIMEOUT = 30.0
 
     def __init__(self, url: str, headers: Optional[Dict[str, str]] = None,
                  timeout: float = 60.0) -> None:
@@ -239,6 +324,8 @@ class _SSETransport:
         self._client: Optional[httpx.AsyncClient] = None
         self._pending: Dict[int, asyncio.Future] = {}
         self._reader_task: Optional[asyncio.Task] = None
+        self._endpoint_event: Optional[asyncio.Event] = None
+        self._start_error: Optional[Exception] = None
         self._next_id: int = 1
 
     async def start(self) -> None:
@@ -247,50 +334,31 @@ class _SSETransport:
             headers=self._headers,
             follow_redirects=True,
         )
-        # Connect to the SSE endpoint to discover the message endpoint.
+        self._endpoint_event = asyncio.Event()
+        self._start_error = None
+        # Open the SSE stream and keep it open; it is the only channel on
+        # which the server can push responses back to us.
+        self._reader_task = asyncio.create_task(self._sse_loop())
         try:
-            async with self._client.stream("GET", self._url + "/sse") as resp:
-                if resp.status_code != 200:
-                    await resp.aread()
-                    raise MCPConnectionError(
-                        f"MCP SSE endpoint returned HTTP {resp.status_code}: {self._url}/sse"
-                    )
-                # Read lines until we get the endpoint event.
-                event_type = ""
-                async for raw_line in resp.aiter_lines():
-                    line = raw_line.strip()
-                    if line.startswith("event:"):
-                        event_type = line[6:].strip()
-                    elif line.startswith("data:"):
-                        data = line[5:].strip()
-                        if event_type == "endpoint":
-                            # The endpoint may be relative or absolute.
-                            if data.startswith("http://") or data.startswith("https://"):
-                                self._message_endpoint = data
-                            elif data.startswith("/"):
-                                base = self._url.split("/sse")[0]
-                                self._message_endpoint = base + data
-                            else:
-                                base = self._url.rsplit("/", 1)[0]
-                                self._message_endpoint = base + "/" + data
-                            break
-        except httpx.ConnectError as exc:
+            await asyncio.wait_for(
+                self._endpoint_event.wait(), timeout=self.ENDPOINT_TIMEOUT
+            )
+        except asyncio.TimeoutError as exc:
+            await self.stop()
             raise MCPConnectionError(
-                f"Could not connect to MCP server at {self._url}.\n"
-                "Is the server running and is the URL correct?"
+                f"MCP server at {self._url} did not announce a message "
+                "endpoint in time. Is the URL correct and is the server "
+                "speaking the MCP SSE protocol?"
             ) from exc
-        except httpx.TimeoutException as exc:
-            raise MCPConnectionError(
-                f"Timed out connecting to MCP server at {self._url}"
-            ) from exc
-
+        if self._start_error is not None:
+            err = self._start_error
+            await self.stop()
+            raise err
         if not self._message_endpoint:
+            await self.stop()
             raise MCPConnectionError(
                 f"MCP server at {self._url} did not provide a message endpoint."
             )
-
-        # Start a background task to read SSE events for responses.
-        self._reader_task = asyncio.create_task(self._read_sse_loop())
 
     async def stop(self) -> None:
         if self._reader_task:
@@ -299,11 +367,14 @@ class _SSETransport:
                 await self._reader_task
             except (asyncio.CancelledError, Exception):
                 pass
+        self._reader_task = None
         if self._client:
             await self._client.aclose()
             self._client = None
 
-    async def send_request(self, method: str, params: Any = None) -> Any:
+    async def send_request(
+        self, method: str, params: Any = None, timeout: Optional[float] = None
+    ) -> Any:
         if not self._client or not self._message_endpoint:
             raise MCPConnectionError("SSE transport not started")
         req_id = self._next_id
@@ -319,13 +390,22 @@ class _SSETransport:
                 headers={"Content-Type": "application/json"},
             )
             if resp.status_code >= 400:
+                self._pending.pop(req_id, None)
                 raise MCPToolError(
                     f"MCP server returned HTTP {resp.status_code}: {resp.text[:200]}"
                 )
         except httpx.ConnectError as exc:
             self._pending.pop(req_id, None)
             raise MCPConnectionError(f"Lost connection to MCP server: {exc}") from exc
-        return await asyncio.wait_for(fut, timeout=60)
+        try:
+            return await asyncio.wait_for(
+                fut, timeout=60.0 if timeout is None else timeout
+            )
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(req_id, None)
+            raise MCPConnectionError(
+                f"MCP server at {self._url} did not answer '{method}' in time."
+            ) from exc
 
     async def send_notification(self, method: str, params: Any = None) -> None:
         if not self._client or not self._message_endpoint:
@@ -337,12 +417,47 @@ class _SSETransport:
             headers={"Content-Type": "application/json"},
         )
 
-    async def _read_sse_loop(self) -> None:
+    def _fail_all(self, exc: Exception) -> None:
+        """Reject every pending request and record the startup error."""
+        if self._start_error is None:
+            self._start_error = exc
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(exc)
+        self._pending.clear()
+
+    def _resolve_endpoint(self, data: str) -> Optional[str]:
+        """Turn the announced endpoint into an absolute URL."""
+        if not data:
+            return None
+        if data.startswith("http://") or data.startswith("https://"):
+            return data
+        if data.startswith("/"):
+            base = self._url.split("/sse")[0]
+            return base + data
+        base = self._url.rsplit("/", 1)[0]
+        return base + "/" + data
+
+    async def _sse_loop(self) -> None:
+        """Hold the SSE stream open: discover the endpoint, then read replies."""
         if not self._client:
             return
         try:
-            async with self._client.stream("GET", self._url + "/sse") as resp:
+            # NOTE: read timeout disabled — the stream must stay open for the
+            # whole session, even when the server is quiet for a while.
+            async with self._client.stream(
+                "GET",
+                self._url + "/sse",
+                timeout=httpx.Timeout(15.0, read=None),
+            ) as resp:
                 if resp.status_code != 200:
+                    await resp.aread()
+                    self._fail_all(
+                        MCPConnectionError(
+                            f"MCP SSE endpoint returned HTTP {resp.status_code}: "
+                            f"{self._url}/sse"
+                        )
+                    )
                     return
                 event_type = ""
                 async for raw_line in resp.aiter_lines():
@@ -351,28 +466,52 @@ class _SSETransport:
                         event_type = line[6:].strip()
                     elif line.startswith("data:"):
                         data = line[5:].strip()
-                        if event_type == "message" and data:
-                            try:
-                                msg = json.loads(data)
-                            except json.JSONDecodeError:
-                                continue
-                            msg_id = msg.get("id")
-                            if msg_id is not None and msg_id in self._pending:
-                                fut = self._pending.pop(msg_id)
-                                if "error" in msg:
-                                    err = msg["error"]
-                                    fut.set_exception(
-                                        MCPToolError(
-                                            f"MCP error {err.get('code', '?')}: "
-                                            f"{err.get('message', 'unknown')}"
-                                        )
-                                    )
-                                else:
-                                    fut.set_result(msg.get("result"))
+                        if event_type == "endpoint" and not self._message_endpoint:
+                            self._message_endpoint = self._resolve_endpoint(data)
+                            if self._endpoint_event is not None:
+                                self._endpoint_event.set()
+                        elif event_type == "message" and data:
+                            self._handle_message(data)
+                # Stream closed by the server — nothing more can arrive.
+                self._fail_all(
+                    MCPConnectionError(
+                        f"The SSE stream from {self._url} was closed by the server."
+                    )
+                )
+        except httpx.ConnectError:
+            self._fail_all(
+                MCPConnectionError(
+                    f"Could not connect to MCP server at {self._url}.\n"
+                    "Is the server running and is the URL correct?"
+                )
+            )
         except asyncio.CancelledError:
             pass
-        except Exception:
-            pass
+        except Exception as exc:
+            self._fail_all(MCPConnectionError(f"MCP SSE stream error: {exc}"))
+        finally:
+            if self._endpoint_event is not None:
+                self._endpoint_event.set()  # wake start() so it can report errors
+
+    def _handle_message(self, data: str) -> None:
+        """Resolve a pending request from an SSE ``message`` event."""
+        try:
+            msg = json.loads(data)
+        except json.JSONDecodeError:
+            return
+        msg_id = msg.get("id")
+        if msg_id is not None and msg_id in self._pending:
+            fut = self._pending.pop(msg_id)
+            if "error" in msg:
+                err = msg["error"]
+                fut.set_exception(
+                    MCPToolError(
+                        f"MCP error {err.get('code', '?')}: "
+                        f"{err.get('message', 'unknown')}"
+                    )
+                )
+            else:
+                fut.set_result(msg.get("result"))
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +573,7 @@ class MCPClient:
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "phoenix-cli", "version": __version__},
-            })
+            }, timeout=120.0)
             await self._transport.send_notification(
                 "notifications/initialized"
             )
@@ -600,7 +739,7 @@ def load_mcp_config() -> List[Dict[str, Any]]:
           "servers": [
             {
               "name": "roblox",
-              "command": ["npx", "-y", "@anthropic/mcp-server-roblox"],
+              "command": ["npx", "-y", "robloxstudio-mcp@latest"],
               "env": {}
             },
             {
