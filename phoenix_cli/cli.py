@@ -2,6 +2,7 @@
 
 Commands
 --------
+phoenix                 interactive chat — just type, /exit to quit
 phoenix "prompt"        one-shot prompt (also: phoenix ask "prompt")
 phoenix chat            interactive chat with 30+ slash commands
 phoenix setup           configure BASE_URL / API_KEY / MODEL_NAME
@@ -29,11 +30,12 @@ import shutil
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import click
 from rich.console import Console
@@ -99,7 +101,10 @@ BANNER = r"""[bold #ff6b00]
    ═╝     ╚═╝  ╚═╝ ╚═════╝ ╚══════╝═╝  ╚═══╝╚═╝╚═╝  ╚═╝
 [/bold #ff6b00]"""
 
-TAGLINE = "AI that rises with you"
+# Branding — the title shown in the banner, help and quick-start dashboard.
+TITLE = "PHOENIX"
+TAGLINE = "Rise. Chat. Create."
+TAGLINE_SUB = "AI that rises with you"
 
 # Code themes supported by rich.
 CODE_THEMES = ("monokai", "github_dark", "dracula", "vs_dark", "fruity", "native")
@@ -516,7 +521,9 @@ def print_banner() -> None:
     console.print(BANNER)
     tagline_panel = Panel(
         Align.center(
-            f"[bold]{TAGLINE}[/bold]\n[dim]v{__version__} • OpenAI-compatible APIs + MCP • Termux-ready[/dim]",
+            f"[bold {ACCENT}]{TITLE} — {TAGLINE}[/bold {ACCENT}]\n"
+            f"[dim]{TAGLINE_SUB} • v{__version__} • "
+            "OpenAI-compatible APIs + MCP • Termux-ready[/dim]",
             vertical="middle",
         ),
         box=DOUBLE,
@@ -577,6 +584,35 @@ def make_client(params: Dict[str, Any]) -> PhoenixClient:
         extra_headers=params.get("extra_headers"),
         timeout=params.get("timeout", 300.0),
     )
+
+
+def _run_async(coro: Any) -> Any:
+    """Run a coroutine and return its result, whatever the context.
+
+    ``asyncio.run()`` refuses to run while another event loop is active in
+    this thread (which is the case for slash commands inside the chat
+    loop), so in that situation the coroutine runs on a fresh loop in a
+    helper thread instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: Dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on caller side
+            result["exc"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True, name="phoenix-async")
+    thread.start()
+    thread.join()
+    if "exc" in result:
+        raise result["exc"]
+    return result["value"]
 
 
 # ---------------------------------------------------------------------------
@@ -779,11 +815,17 @@ async def _stream_turn(
     auto_approve: bool = True,
     theme: str = "monokai",
     verbose: bool = False,
+    ask_user: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> tuple[bool, str]:
     """Run one chat-completions request and print the streamed reply.
 
     Handles the full tool-use loop when ``mcp_manager`` is provided.
     When ``auto_approve`` is False, prompts the user before each tool call.
+
+    ``ask_user``, when given, is awaited for tool approval instead of the
+    synchronous ``_ask_user_yn`` — used by the threaded chat loop where a
+    prompt_toolkit application owns stdin. It may raise
+    ``asyncio.CancelledError`` to signal "the user pressed Ctrl+C".
     """
     buffer: List[str] = []
     usage: Dict[str, Any] = {}
@@ -904,7 +946,11 @@ async def _stream_turn(
                                 box=ROUNDED,
                             )
                         )
-                        if not _ask_user_yn("Execute this tool?", default=True):
+                        if ask_user is not None:
+                            approved = await ask_user()
+                        else:
+                            approved = _ask_user_yn("Execute this tool?", default=True)
+                        if not approved:
                             console.print(Text("  ✖ skipped", style="dim yellow"))
                             _add_tool_result(
                                 conversation,
@@ -954,7 +1000,10 @@ async def _stream_turn(
 
 
 HELP_TEXT = """\
-[bold #ff6b00]Phoenix CLI — all commands[/bold #ff6b00]
+[bold #ff6b00]PHOENIX — Rise. Chat. Create.[/bold #ff6b00]
+
+Just type a message and press Enter to talk to the AI — no commands needed.
+Slash commands (below) are optional and only used when you want them.
 
 [bold]Navigation[/bold]
   /help              show this help
@@ -1010,6 +1059,43 @@ HELP_TEXT = """\
 """
 
 
+def _finish_model_pick(text: str, state: Dict[str, Any]) -> bool:
+    """Handle the numbered answer to the /model picker.
+
+    Returns True when the pending pick was consumed (a choice was made,
+    skipped, or cancelled).  The caller only invokes this when
+    ``state["_pending_model_pick"]`` is set.
+    """
+    ids = state.pop("_pending_model_pick", None) or []
+    raw = text.strip()
+    if raw.startswith("/"):
+        # A slash command cancels the picker; the caller then processes it.
+        console.print(Text("  picker cancelled", style="dim"))
+        return False
+    try:
+        choice = int(raw)
+    except ValueError:
+        console.print(
+            Text("Enter a number (0 to skip), or / to cancel.", style="yellow")
+        )
+        state["_pending_model_pick"] = ids
+        return True
+    if choice == 0:
+        console.print(Text("  picker cancelled", style="dim"))
+        return True
+    if 1 <= choice <= len(ids):
+        state["model"] = ids[choice - 1]
+        console.print(
+            Text(f"✔ switched to: {state['model']}", style="bold green")
+        )
+        return True
+    console.print(
+        Text(f"Invalid number. Enter 1-{len(ids)} or 0 to skip.", style="red")
+    )
+    state["_pending_model_pick"] = ids
+    return True
+
+
 def _handle_slash_command(
     command: str,
     conversation: Conversation,
@@ -1056,7 +1142,7 @@ def _handle_slash_command(
             params = _params(cfg, model=state["model"])
             params["timeout"] = 15.0
             try:
-                ids = asyncio.run(_list_models(params))
+                ids = _run_async(_list_models(params))
                 if not ids:
                     console.print("[dim]Provider returned no models.[/dim]")
                 else:
@@ -1074,27 +1160,13 @@ def _handle_slash_command(
                         table.add_row(str(i), mid + marker)
                     console.print(table)
                     console.print()
-                    try:
-                        choice = click.prompt(
-                            "Enter number (0 to skip)",
-                            type=int,
-                            default=0,
-                            show_default=True,
+                    state["_pending_model_pick"] = ids
+                    console.print(
+                        Text(
+                            "Type the number below (0 to skip, / to cancel)",
+                            style="dim cyan",
                         )
-                    except (KeyboardInterrupt, click.Abort):
-                        console.print()
-                        return None
-                    if 1 <= choice <= len(ids):
-                        state["model"] = ids[choice - 1]
-                        console.print(
-                            Text(
-                                f"✔ switched to: {state['model']}", style="bold green"
-                            )
-                        )
-                    elif choice != 0:
-                        console.print(
-                            Text(f"Invalid number. Enter 1-{len(ids)}.", style="red")
-                        )
+                    )
             except PhoenixError as exc:
                 print_error(exc)
             except Exception as exc:
@@ -1120,7 +1192,7 @@ def _handle_slash_command(
         params = _params(cfg, model=state["model"])
         params["timeout"] = 15.0
         try:
-            ids = asyncio.run(_list_models(params))
+            ids = _run_async(_list_models(params))
             if not ids:
                 console.print("[dim]Provider returned no models.[/dim]")
                 return None
@@ -1268,7 +1340,7 @@ def _handle_slash_command(
         params["temperature"] = 0.0
         use_live = console.is_terminal
         try:
-            ok, summary = asyncio.run(
+            ok, summary = _run_async(
                 _stream_turn(
                     params,
                     conversation,
@@ -1432,7 +1504,7 @@ def _handle_slash_command(
         params["timeout"] = 15.0
         t0 = time.perf_counter()
         try:
-            ok = asyncio.run(_probe(params))
+            ok = _run_async(_probe(params))
         except PhoenixError as exc:
             print_error(exc)
             ok = False
@@ -1623,6 +1695,11 @@ def _save_conversation(conversation: Conversation, path: Path, model: str) -> No
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+# Markers passed from the input thread to the chat loop.
+_CTRL_C = "\x00ctrl-c"
+_EOF = "\x00eof"
+
+
 def _read_user_input(session: Any, interactive: bool) -> Optional[str]:
     """Read one line from the user (prompt_toolkit when available)."""
     if interactive and session is not None:
@@ -1636,8 +1713,14 @@ def _read_user_input(session: Any, interactive: bool) -> Optional[str]:
 
 
 def _make_session(interactive: bool) -> Optional[Any]:
-    """Create a prompt_toolkit session, or ``None`` if unavailable."""
+    """Create a prompt_toolkit session, or ``None`` if unavailable.
+
+    Set ``PHOENIX_NO_PROMPT_TOOLKIT=1`` to force the plain ``input()``
+    fallback (handy on terminals where prompt_toolkit misbehaves).
+    """
     if not interactive:
+        return None
+    if os.environ.get("PHOENIX_NO_PROMPT_TOOLKIT"):
         return None
     try:
         from prompt_toolkit import PromptSession
@@ -1647,6 +1730,371 @@ def _make_session(interactive: bool) -> Optional[Any]:
         return None
 
 
+async def _stream_turn_on_loop(
+    params: Dict[str, Any],
+    conversation: Conversation,
+    lines_q: "asyncio.Queue",
+    ctrl_q: "asyncio.Queue",
+    *,
+    mcp_manager: Optional[MCPManager],
+    auto_approve: bool,
+    theme: str,
+    verbose: bool,
+) -> tuple[bool, bool]:
+    """Run one streamed turn on the chat's event loop.
+
+    The prompt application keeps running (and keeps reading the terminal)
+    in its own thread, so anything the user types during the reply is
+    buffered safely — fast typing can never lose or garble a message.
+
+    Lines typed during the stream stay queued in ``lines_q`` and are sent
+    one by one afterwards; Ctrl+C (``ctrl_q``) cancels the in-flight
+    reply.
+
+    Returns ``(interrupted, eof)``: whether the turn was cancelled by
+    Ctrl+C and whether the user pressed Ctrl+D.
+    """
+    interrupted = False
+    eof_pending = False
+    waiting = {"active": False}
+
+    async def _approve() -> bool:
+        """Bridge tool approval to the input thread (async)."""
+        waiting["active"] = True
+        try:
+            while True:
+                item = await lines_q.get()
+                if item == _CTRL_C:  # defensive — control goes via ctrl_q
+                    raise asyncio.CancelledError
+                answer = item.strip().lower()
+                if answer in ("y", "yes", "1", "true", ""):
+                    return True
+                if answer in ("n", "no", "0", "false"):
+                    return False
+                console.print(Text("  Please answer y or n", style="yellow"))
+        finally:
+            waiting["active"] = False
+
+    async def _watch_input(stream_task: "asyncio.Task") -> None:
+        """Cancel the stream when the user presses Ctrl+C or Ctrl+D."""
+        nonlocal eof_pending
+        try:
+            while True:
+                item = await ctrl_q.get()
+                if item == _EOF:
+                    eof_pending = True
+                stream_task.cancel()
+                return
+        except asyncio.CancelledError:
+            pass
+
+    loop = asyncio.get_running_loop()
+    stream_task: asyncio.Task = loop.create_task(
+        _stream_turn(
+            params,
+            conversation,
+            use_live=True,
+            mcp_manager=mcp_manager,
+            auto_approve=auto_approve,
+            theme=theme,
+            verbose=verbose,
+            ask_user=_approve,
+        )
+    )
+    watcher_task = loop.create_task(_watch_input(stream_task))
+    try:
+        await stream_task
+    except asyncio.CancelledError:
+        interrupted = True
+    finally:
+        watcher_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watcher_task
+    return interrupted, eof_pending
+
+
+async def _wait_for_input(
+    lines_q: "asyncio.Queue", ctrl_q: "asyncio.Queue"
+) -> str:
+    """Wait for either a typed line or a control marker."""
+    loop = asyncio.get_running_loop()
+    line_get = loop.create_task(lines_q.get())
+    ctrl_get = loop.create_task(ctrl_q.get())
+    try:
+        done, pending = await asyncio.wait(
+            {line_get, ctrl_get}, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        for task in (line_get, ctrl_get):
+            if not task.done():
+                task.cancel()
+    winner = next(iter(done))
+    return winner.result()
+
+
+def _chat_turn(
+    text: Optional[str],
+    conversation: Conversation,
+    state: Dict[str, Any],
+    cfg: Dict[str, str],
+    mcp_manager: Optional[MCPManager],
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Send one user message and stream the reply on ``loop``.
+
+    ``text=None`` re-sends the last user message already in the
+    conversation (used by /retry).
+    """
+    if text is not None:
+        conversation.add("user", text)
+    params = _params(
+        cfg,
+        model=state["model"],
+        temperature=state["temperature"],
+        max_tokens=state["max_tokens"],
+    )
+    try:
+        loop.run_until_complete(
+            _stream_turn(
+                params,
+                conversation,
+                use_live=True,
+                mcp_manager=mcp_manager,
+                auto_approve=state.get("auto_approve", True),
+                theme=state.get("theme", "monokai"),
+                verbose=state.get("verbose", False),
+            )
+        )
+    except KeyboardInterrupt:
+        console.print(Text(" interrupted — reply cancelled", style="dim"))
+        _pop_last_exchange(conversation)
+
+
+def _stop_prompt_app(session: Any, timeout: float = 2.0) -> None:
+    """Ask the running prompt application to finish cleanly (thread-safe).
+
+    Restores the terminal (cooked mode, echo on) before the process exits —
+    without this, quitting mid-prompt could leave the user's shell broken.
+
+    The prompt application is started fresh for every line, so there is a
+    tiny window where it is between runs; we retry briefly until a run is
+    active and can be asked to exit.
+    """
+    app = getattr(session, "app", None)
+    if app is None:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        loop = getattr(app, "loop", None)
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(app.exit)
+                return
+            except Exception:
+                pass  # startup window: future not attached yet — retry
+        time.sleep(0.02)
+
+
+def _pop_last_exchange(conversation: Conversation) -> int:
+    """Remove the trailing assistant/tool messages and the user message
+    before them. Returns how many messages were removed.
+
+    Also drops the parallel tool-call metadata, so a reply cancelled
+    mid-tool-call never leaves an assistant ``tool_calls`` message without
+    its tool results in history (which providers reject).
+    """
+    removed = 0
+    while conversation.messages and conversation.messages[-1].role in (
+        "assistant",
+        "tool",
+    ):
+        idx = len(conversation.messages) - 1
+        for attr in ("_tool_msgs", "_tool_call_ids"):
+            if hasattr(conversation, attr):
+                getattr(conversation, attr).pop(idx, None)
+        conversation.messages.pop()
+        removed += 1
+    if conversation.messages and conversation.messages[-1].role == "user":
+        conversation.messages.pop()
+        removed += 1
+    return removed
+
+
+async def _run_chat_threaded(
+    session: Any,
+    conversation: Conversation,
+    state: Dict[str, Any],
+    cfg: Dict[str, str],
+    mcp_manager: Optional[MCPManager],
+    loop: asyncio.AbstractEventLoop,
+) -> int:
+    """Chat loop with prompt_toolkit running in a background thread.
+
+    The prompt application owns the terminal for the whole session, so
+    * typing while a reply is streaming is buffered by prompt_toolkit
+      itself — fast messages are never dropped or garbled;
+    * all output goes through ``patch_stdout`` and is printed *above* the
+      prompt, which stays visible at the bottom;
+    * Ctrl+C cancels the in-flight reply; Ctrl+D or /exit quits.
+    """
+    from prompt_toolkit.patch_stdout import patch_stdout
+    from prompt_toolkit.styles import Style
+
+    style = Style.from_dict({"prompt": f"{ACCENT} bold"})
+    lines_q: asyncio.Queue = asyncio.Queue()
+    ctrl_q: asyncio.Queue = asyncio.Queue()
+    stop_event = threading.Event()
+
+    def input_worker() -> None:
+        while not stop_event.is_set():
+            try:
+                text = session.prompt(
+                    [("class:prompt", "phoenix"), ("", " ❯ ")],
+                    style=style,
+                )
+            except KeyboardInterrupt:
+                loop.call_soon_threadsafe(ctrl_q.put_nowait, _CTRL_C)
+                continue
+            except EOFError:
+                loop.call_soon_threadsafe(ctrl_q.put_nowait, _EOF)
+                break
+            except Exception:
+                loop.call_soon_threadsafe(ctrl_q.put_nowait, _EOF)
+                break
+            if text is None:  # programmatic exit (e.g. /exit path)
+                loop.call_soon_threadsafe(ctrl_q.put_nowait, _EOF)
+                break
+            loop.call_soon_threadsafe(lines_q.put_nowait, text)
+
+    thread = threading.Thread(target=input_worker, daemon=True, name="phoenix-input")
+    thread.start()
+
+    try:
+        with patch_stdout(raw=True):
+            while True:
+                item = await _wait_for_input(lines_q, ctrl_q)
+                if item == _EOF:
+                    console.print()
+                    console.print("[dim]Bye![/dim]")
+                    break
+                if item == _CTRL_C:
+                    console.print(
+                        Text(
+                            "^C — nothing to cancel. /exit or Ctrl+D to quit.",
+                            style="dim",
+                        )
+                    )
+                    continue
+
+                text = item.strip()
+                if not text:
+                    continue
+                if state.get("_pending_model_pick") is not None:
+                    if _finish_model_pick(text, state):
+                        continue
+                if text.startswith("/"):
+                    if (
+                        _handle_slash_command(
+                            text,
+                            conversation,
+                            state,
+                            cfg,
+                            mcp_manager,
+                        )
+                        == "exit"
+                    ):
+                        console.print("[dim]Bye![/dim]")
+                        break
+                    if state.pop("_retry", False):
+                        pass  # /retry: last user message is already queued
+                    else:
+                        continue
+                else:
+                    conversation.add("user", text)
+
+                interrupted, eof_pending = await _stream_turn_on_loop(
+                    _params(
+                        cfg,
+                        model=state["model"],
+                        temperature=state["temperature"],
+                        max_tokens=state["max_tokens"],
+                    ),
+                    conversation,
+                    lines_q,
+                    ctrl_q,
+                    mcp_manager=mcp_manager,
+                    auto_approve=state.get("auto_approve", True),
+                    theme=state.get("theme", "monokai"),
+                    verbose=state.get("verbose", False),
+                )
+                if interrupted and not eof_pending:
+                    console.print(
+                        Text(" interrupted — reply cancelled", style="dim")
+                    )
+                    _pop_last_exchange(conversation)
+                console.print()
+                if eof_pending:
+                    console.print("[dim]Bye![/dim]")
+                    break
+    finally:
+        stop_event.set()
+        _stop_prompt_app(session)
+        thread.join(timeout=3.0)
+    return 0
+
+
+def _run_chat_fallback(
+    conversation: Conversation,
+    state: Dict[str, Any],
+    cfg: Dict[str, str],
+    mcp_manager: Optional[MCPManager],
+    loop: asyncio.AbstractEventLoop,
+) -> int:
+    """Chat loop used when prompt_toolkit is unavailable (plain input())."""
+    while True:
+        try:
+            user_input = _read_user_input(None, True)
+        except EOFError:
+            # Ctrl+D quits, exactly like the prompt_toolkit chat loop.
+            console.print("\n[dim]Bye![/dim]")
+            break
+        except KeyboardInterrupt:
+            console.print()
+            console.print("[dim]Ctrl+D or /exit to quit.[/dim]")
+            continue
+        if user_input is None:
+            console.print("\n[dim]Bye![/dim]")
+            break
+
+        text = user_input.strip()
+        if not text:
+            continue
+        if state.get("_pending_model_pick") is not None:
+            if _finish_model_pick(text, state):
+                continue
+        if text.startswith("/"):
+            if (
+                _handle_slash_command(
+                    text,
+                    conversation,
+                    state,
+                    cfg,
+                    mcp_manager,
+                )
+                == "exit"
+            ):
+                console.print("[dim]Bye![/dim]")
+                break
+            if state.pop("_retry", False):
+                _chat_turn(None, conversation, state, cfg, mcp_manager, loop)
+                console.print()
+            continue
+
+        _chat_turn(text, conversation, state, cfg, mcp_manager, loop)
+        console.print()
+    return 0
+
+
 def run_chat(
     cfg: Dict[str, str],
     system: Optional[str],
@@ -1654,7 +2102,10 @@ def run_chat(
     temperature: Optional[float],
     max_tokens: Optional[int],
 ) -> int:
-    """The interactive chat loop. Returns the process exit code."""
+    """The interactive chat loop. Returns the process exit code.
+
+    You just type messages — no commands needed — until /exit.
+    """
     interactive = sys.stdin.isatty() and console.is_terminal
     if not interactive:
         print_error(
@@ -1685,93 +2136,48 @@ def run_chat(
     )
     console.print(f"[bold]API:[/bold]   {cfg['base_url']}")
 
+    # One event loop for the whole session: MCP transports keep their
+    # reader tasks alive on it, so tool calls work in every turn.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     mcp_manager = None
     try:
-        mcp_manager = asyncio.run(_connect_mcp(cfg))
-    except Exception:
-        pass
-
-    if mcp_manager:
-        tool_count = len(mcp_manager.get_tool_names())
-        console.print(
-            f"[bold]MCP:[/bold]   {tool_count} tool(s) from "
-            f"{len(mcp_manager.connected_servers)} server(s)"
-        )
-        auto = state.get("auto_approve", True)
-        console.print(f"[bold]Auto-approve:[/bold] {'ON' if auto else 'OFF'}")
-
-    console.print("[dim]Type /help for 30+ commands • Ctrl+C cancels a reply[/dim]")
-    console.print()
-
-    session = _make_session(interactive)
-    while True:
         try:
-            user_input = _read_user_input(session, interactive)
-        except (KeyboardInterrupt, EOFError):
-            console.print()
+            mcp_manager = loop.run_until_complete(_connect_mcp(cfg))
+        except Exception:
+            pass
+
+        if mcp_manager:
+            tool_count = len(mcp_manager.get_tool_names())
             console.print(
-                "[dim]Ctrl+D or /exit to quit; Ctrl+C once more to force.[/dim]"
+                f"[bold]MCP:[/bold]   {tool_count} tool(s) from "
+                f"{len(mcp_manager.connected_servers)} server(s)"
             )
-            continue
-        if user_input is None:
-            console.print("\n[dim]Bye![/dim]")
-            break
+            auto = state.get("auto_approve", True)
+            console.print(f"[bold]Auto-approve:[/bold] {'ON' if auto else 'OFF'}")
 
-        text = user_input.strip()
-        if not text:
-            continue
-        if text.startswith("/"):
-            if (
-                _handle_slash_command(
-                    text,
-                    conversation,
-                    state,
-                    cfg,
-                    mcp_manager,
-                )
-                == "exit"
-            ):
-                console.print("[dim]Bye![/dim]")
-                break
-            if state.pop("_retry", False):
-                # /retry: re-send last user message.
-                pass
-            else:
-                continue
-
-        conversation.add("user", text)
-        params = _params(
-            cfg,
-            model=state["model"],
-            temperature=state["temperature"],
-            max_tokens=state["max_tokens"],
+        console.print(
+            "[dim]Just type to chat — no commands needed • /help for commands • "
+            "Ctrl+C cancels a reply • /exit quits[/dim]"
         )
-        try:
-            asyncio.run(
-                _stream_turn(
-                    params,
-                    conversation,
-                    use_live=True,
-                    mcp_manager=mcp_manager,
-                    auto_approve=state.get("auto_approve", True),
-                    theme=state.get("theme", "monokai"),
-                    verbose=state.get("verbose", False),
-                )
-            )
-        except KeyboardInterrupt:
-            console.print(Text(" interrupted — reply cancelled", style="dim"))
-            if conversation.messages and conversation.messages[-1].role == "user":
-                conversation.messages.pop()
         console.print()
 
-    if mcp_manager:
-        asyncio.run(mcp_manager.close())
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Single-prompt mode
-# ---------------------------------------------------------------------------
+        session = _make_session(interactive)
+        if session is not None:
+            return loop.run_until_complete(
+                _run_chat_threaded(session, conversation, state, cfg, mcp_manager, loop)
+            )
+        return _run_chat_fallback(conversation, state, cfg, mcp_manager, loop)
+    finally:
+        if mcp_manager:
+            try:
+                loop.run_until_complete(mcp_manager.close())
+            except Exception:
+                pass
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def run_single_prompt(
@@ -1790,28 +2196,40 @@ def run_single_prompt(
     params = _params(cfg, model=model, temperature=temperature, max_tokens=max_tokens)
     use_live = console.is_terminal and not no_stream
 
+    # One event loop for MCP connect + the request (same reason as chat).
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     mcp_manager = None
+    ok = False
     try:
-        mcp_manager = asyncio.run(_connect_mcp(cfg))
-    except Exception:
-        pass
+        try:
+            mcp_manager = loop.run_until_complete(_connect_mcp(cfg))
+        except Exception:
+            pass
 
-    try:
-        ok, _ = asyncio.run(
-            _stream_turn(
-                params,
-                conversation,
-                use_live=use_live,
-                mcp_manager=mcp_manager,
-                auto_approve=True,
+        try:
+            ok, _ = loop.run_until_complete(
+                _stream_turn(
+                    params,
+                    conversation,
+                    use_live=use_live,
+                    mcp_manager=mcp_manager,
+                    auto_approve=True,
+                )
             )
-        )
-    except KeyboardInterrupt:
-        console.print(Text("✖ interrupted — reply cancelled", style="dim"))
-        return 130
+        except KeyboardInterrupt:
+            console.print(Text("✖ interrupted — reply cancelled", style="dim"))
+            return 130
     finally:
         if mcp_manager:
-            asyncio.run(mcp_manager.close())
+            try:
+                loop.run_until_complete(mcp_manager.close())
+            except Exception:
+                pass
+        try:
+            loop.close()
+        except Exception:
+            pass
     return 0 if ok else 1
 
 
@@ -1937,6 +2355,78 @@ class PhoenixGroup(click.Group):
             return "ask", ask_cmd, list(args)
 
 
+def _print_dashboard() -> None:
+    """Print the retro quick-start dashboard (see `phoenix intro`)."""
+    print_banner()
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column()
+    grid.add_column()
+
+    left = Panel(
+        f"[bold {ACCENT}]💬 Chat & Prompt[/bold {ACCENT}]\n"
+        f"  [bold #ff6b00]phoenix[/bold #ff6b00]                      interactive chat — just type!\n"
+        f"  [bold #ff6b00]phoenix \"explain quicksort\"[/bold #ff6b00]  one-shot prompt\n"
+        f"  [bold #ff6b00]phoenix -m NAME \"prompt\"[/bold #ff6b00]  one-off model override\n\n"
+        f"[bold {ACCENT}]⚙️ Setup & Config[/bold {ACCENT}]\n"
+        f"  [bold #ff6b00]phoenix setup[/bold #ff6b00]            configure provider + model\n"
+        f"  [bold #ff6b00]phoenix status[/bold #ff6b00]           show current configuration\n"
+        f"  [bold #ff6b00]phoenix models --select[/bold #ff6b00]  pick model from list\n"
+        f"  [bold #ff6b00]phoenix mcp add-roblox[/bold #ff6b00]   one-command Roblox MCP",
+        box=ROUNDED,
+        border_style=ACCENT,
+        title=f"[bold]Quick start[/bold]",
+        padding=(1, 2),
+    )
+
+    right = Panel(
+        f"[bold]Examples[/bold]\n"
+        f"[dim]Local Ollama:[/dim]\n"
+        f"  http://localhost:11434\n\n"
+        f"[dim]Cloud:[/dim]\n"
+        f"  https://api.openrouter.ai/api\n"
+        f"  https://api.groq.com/openai\n\n"
+        f"[bold]Features[/bold]\n"
+        f"  • Any OpenAI-compatible API\n"
+        f"  • MCP tools (Roblox etc.)\n"
+        f"  • 30+ chat commands\n"
+        f"  • Termux-ready\n"
+        f"  • Streaming + markdown",
+        box=ROUNDED,
+        border_style="bright_black",
+        title="[bold]Info[/bold]",
+        padding=(1, 2),
+    )
+
+    console.print(
+        Panel(
+            Columns([left, right], equal=True, expand=True),
+            box=DOUBLE,
+            border_style=ACCENT,
+            title=f"[bold {ACCENT}]🔥 {TITLE} v{__version__} — {TAGLINE}[/bold {ACCENT}]",
+            subtitle="[dim]Type /help inside chat to see every command[/dim]",
+        )
+    )
+
+
+def _start_chat(
+    cfg: Dict[str, str],
+    system: Optional[str],
+    model: Optional[str],
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+) -> None:
+    """Shared entry for `phoenix chat` and bare `phoenix`."""
+    problem = check_configured(cfg)
+    if problem:
+        print_error(ConfigurationError(problem))
+        raise SystemExit(1)
+    raise SystemExit(
+        run_chat(
+            cfg, system=system, model=model, temperature=temperature, max_tokens=max_tokens
+        )
+    )
+
+
 @click.group(cls=PhoenixGroup)
 @click.version_option(version=__version__, prog_name="phoenix")
 @click.option(
@@ -1966,62 +2456,22 @@ def cli(
     max_tokens: Optional[int],
     no_stream: bool,
 ) -> None:
-    """Phoenix CLI — AI that rises with you.
+    """PHOENIX — Rise. Chat. Create.
 
-    Works with any OpenAI-compatible API and supports MCP for tool use.
-    Type `phoenix --help` for the full command list.
+    Just run `phoenix` to start chatting (no commands needed — type
+    messages until you /exit). Works with any OpenAI-compatible API and
+    supports MCP for tool use.
     """
     if ctx.invoked_subcommand is None:
-        print_banner()
-        # Retro quick-start dashboard inspired by reference image
-        grid = Table.grid(padding=(0, 2))
-        grid.add_column()
-        grid.add_column()
+        # Bare `phoenix` (no prompt, no subcommand) = interactive chat.
+        cfg = load_config()
+        _start_chat(cfg, system, model, temperature, max_tokens)
 
-        left = Panel(
-            f"[bold {ACCENT}]⚙️ Setup & Config[/bold {ACCENT}]\n"
-            f"  [bold #ff6b00]phoenix setup[/bold #ff6b00]            configure provider + model\n"
-            f"  [bold #ff6b00]phoenix status[/bold #ff6b00]           show current configuration\n"
-            f"  [bold #ff6b00]phoenix models --select[/bold #ff6b00]  pick model from list\n"
-            f"  [bold #ff6b00]phoenix mcp add[/bold #ff6b00]          add MCP server\n\n"
-            f"[bold {ACCENT}]💬 Chat & Prompt[/bold {ACCENT}]\n"
-            f"  [bold #ff6b00]phoenix \"explain quicksort\"[/bold #ff6b00]  one-shot prompt\n"
-            f"  [bold #ff6b00]phoenix chat[/bold #ff6b00]            interactive chat (30+ commands)\n"
-            f"  [bold #ff6b00]phoenix -m NAME \"prompt\"[/bold #ff6b00]  one-off model override",
-            box=ROUNDED,
-            border_style=ACCENT,
-            title=f"[bold]Quick start[/bold]",
-            padding=(1, 2),
-        )
 
-        right = Panel(
-            f"[bold]Examples[/bold]\n"
-            f"[dim]Local Ollama:[/dim]\n"
-            f"  http://localhost:11434\n\n"
-            f"[dim]Cloud:[/dim]\n"
-            f"  https://api.openrouter.ai/api\n"
-            f"  https://api.groq.com/openai\n\n"
-            f"[bold]Features[/bold]\n"
-            f"  • Any OpenAI-compatible API\n"
-            f"  • MCP tools (Roblox etc.)\n"
-            f"  • 30+ chat commands\n"
-            f"  • Termux-ready\n"
-            f"  • Streaming + markdown",
-            box=ROUNDED,
-            border_style="bright_black",
-            title="[bold]Info[/bold]",
-            padding=(1, 2),
-        )
-
-        console.print(
-            Panel(
-                Columns([left, right], equal=True, expand=True),
-                box=DOUBLE,
-                border_style=ACCENT,
-                title=f"[bold {ACCENT}]🔥 Phoenix CLI v{__version__}[/bold {ACCENT}]",
-                subtitle="[dim]Type /help inside chat to see every command[/dim]",
-            )
-        )
+@cli.command()
+def intro() -> None:
+    """Show the quick-start dashboard (bare `phoenix` now starts chat)."""
+    _print_dashboard()
 
 
 @cli.command()
@@ -2481,7 +2931,7 @@ def mcp_add() -> None:
         console.print(
             Panel(
                 "[dim]Examples:\n"
-                "  npx -y @anthropic/mcp-server-roblox\n"
+                "  npx -y robloxstudio-mcp@latest    (Roblox MCP)\n"
                 "  python /path/to/server.py\n"
                 "  node /path/to/server.js[/dim]",
                 box=SQUARE,
@@ -2569,6 +3019,80 @@ def mcp_add() -> None:
     console.print()
     console.print(
         f"[dim]Test with: [bold #ff6b00]phoenix mcp test[/bold #ff6b00][/dim]"
+    )
+
+
+# The Roblox MCP preset. This is the well-known, actively maintained
+# `robloxstudio-mcp` package — NOT `@anthropic/mcp-server-roblox`, which does
+# not exist on npm (that nonexistent package is exactly why the old setup
+# instructions never connected).
+ROBLOX_MCP_COMMAND = ["npx", "-y", "robloxstudio-mcp@latest"]
+
+
+@mcp_group.command("add-roblox")
+def mcp_add_roblox() -> None:
+    """Add a working Roblox MCP server in one command.
+
+    Uses the `robloxstudio-mcp` package (stdio, no API key needed). It
+    bridges to Roblox Studio through a local plugin — install the plugin
+    from the package's README and keep Studio open while using it.
+    """
+    servers = load_mcp_config()
+    name = "roblox"
+
+    console.print(
+        Panel(
+            f"[bold]Adding Roblox MCP server[/bold]\n"
+            f"[dim]Command:[/dim] [cyan]{' '.join(ROBLOX_MCP_COMMAND)}[/cyan]\n\n"
+            f"[dim]Prerequisites:[/dim]\n"
+            f"  • Node.js 18+ (Termux: [bold]pkg install nodejs[/bold])\n"
+            f"  • Roblox Studio + the MCP Studio plugin (desktop)\n"
+            f"  • Studio open while the AI calls tools",
+            box=DOUBLE,
+            border_style=ACCENT,
+            title="🔧 Roblox MCP",
+        )
+    )
+    console.print()
+
+    # Replace any existing entry with the same name to avoid duplicates.
+    servers = [s for s in servers if s.get("name") != name]
+    servers.append({"name": name, "command": list(ROBLOX_MCP_COMMAND)})
+    path = save_mcp_config(servers)
+    console.print(
+        Panel(
+            f"[bold green]✓ MCP server 'roblox' added[/bold green]\n"
+            f"[dim]Command: {' '.join(ROBLOX_MCP_COMMAND)}[/dim]",
+            border_style="green",
+            box=ROUNDED,
+        )
+    )
+    console.print(f"[dim]Saved to {path}[/dim]")
+
+    cfg = load_config()
+    if not cfg.get("mcp_enabled"):
+        console.print()
+        enable = Confirm.ask(
+            "Enable MCP in your config? (needed to use tools)", console=console
+        )
+        if enable:
+            save_config(
+                base_url=cfg["base_url"],
+                api_key=cfg.get("api_key", ""),
+                model_name=cfg["model_name"],
+                mcp_enabled=True,
+            )
+            console.print(
+                Panel("✓ MCP enabled", border_style="green", box=ROUNDED)
+            )
+
+    console.print()
+    console.print(
+        "[dim]Test with: [bold #ff6b00]phoenix mcp test roblox[/bold #ff6b00][/dim]"
+    )
+    console.print(
+        "[dim]Tip: the first `phoenix mcp test` may take a while — npx downloads "
+        "the package on first run.[/dim]"
     )
 
 
@@ -2751,9 +3275,9 @@ def chat(
     temperature: Optional[float],
     max_tokens: Optional[int],
 ) -> None:
-    """Start an interactive chat session with 30+ slash commands.
+    """Start an interactive chat session — just type, no commands needed.
 
-    Type /help once inside for the full reference.
+    Slash commands (e.g. /help) are optional; type /exit to quit.
     """
     parent = ctx.parent.params if ctx.parent is not None else {}
     system = system or parent.get("system")
@@ -2764,15 +3288,7 @@ def chat(
         max_tokens = parent.get("max_tokens")
 
     cfg = load_config()
-    problem = check_configured(cfg)
-    if problem:
-        print_error(ConfigurationError(problem))
-        raise SystemExit(1)
-    raise SystemExit(
-        run_chat(
-            cfg, system=system, model=model, temperature=temperature, max_tokens=max_tokens
-        )
-    )
+    _start_chat(cfg, system, model, temperature, max_tokens)
 
 
 if __name__ == "__main__":

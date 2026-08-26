@@ -66,11 +66,26 @@ def test_help_lists_commands():
         assert name in result.output
 
 
-def test_no_args_prints_banner_and_quick_start():
+def test_no_args_starts_chat_requires_terminal(cfg):
+    # Bare `phoenix` now launches interactive chat directly. CliRunner is
+    # not a terminal, so it must fail with the helpful one-shot hint.
     result = CliRunner().invoke(cli, [])
+    assert result.exit_code == 1
+    assert "interactive terminal" in result.output
+
+
+def test_no_args_unconfigured_points_to_setup(clean_env):
+    result = CliRunner().invoke(cli, [])
+    assert result.exit_code == 1
+    assert "phoenix setup" in result.output
+
+
+def test_intro_prints_banner_and_quick_start():
+    result = CliRunner().invoke(cli, ["intro"])
     assert result.exit_code == 0
     assert "Quick start" in result.output
     assert "phoenix setup" in result.output
+    assert "Rise. Chat. Create." in result.output
 
 
 def test_unknown_first_token_routes_to_prompt(clean_env):
@@ -463,3 +478,216 @@ def test_hidden_input_raw_handles_backspace_in_pty():
     out = all_out.decode("utf-8", errors="replace")
     assert "__BS__=" in out, f"Result marker missing; tail: {out[-400:]}"
     assert "'ax'" in out, f"Backspace result wrong; tail: {out[-400:]}"
+
+
+# ---------------------------------------------------------------------------
+# Interactive chat over a real PTY — typed-ahead input & Ctrl+C (1.0.3 fixes)
+# ---------------------------------------------------------------------------
+
+class _SlowStreamHandler:
+    """Threaded HTTP server that streams each reply over ~3 seconds.
+
+    Records the last user message of every request so tests can assert the
+    exact order in which messages reached the provider.
+    """
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import json as _json
+        import threading as _threading
+        import time as _time
+
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    req = _json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    req = {}
+                messages = req.get("messages") or []
+                received.append(
+                    messages[-1].get("content", "") if messages else ""
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                for i in range(8):
+                    chunk = {
+                        "id": "x",
+                        "object": "chat.completion.chunk",
+                        "model": "slow",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"tok{i:02d} "},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    try:
+                        self.wfile.write(
+                            f"data: {_json.dumps(chunk)}\n\n".encode()
+                        )
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    _time.sleep(0.35)
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.received = received
+        _threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @property
+    def base_url(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _drive_pty(argv, schedule, env, timeout=25):
+    """Run `python -m phoenix_cli ARGS...` in a PTY, feeding input on a
+    schedule. Returns the raw terminal output."""
+    import select
+    import time
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(REPO_ROOT)
+        os.execvpe(sys.executable, [sys.executable, "-m", "phoenix_cli", *argv], env)
+
+    out = b""
+    start = time.time()
+    sent = set()
+    try:
+        while time.time() - start < timeout:
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if ready:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                out += data
+            for at, payload in schedule:
+                if at not in sent and time.time() - start >= at:
+                    os.write(fd, payload)
+                    sent.add(at)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+    return out.decode("utf-8", errors="replace")
+
+
+@pytest.mark.skipif(shutil.which("script") is None, reason="needs util-linux `script`")
+def test_bare_phoenix_starts_chat_over_pty(tmp_path, mock_api):
+    """`phoenix` with no arguments must start interactive chat directly."""
+    env = make_env(tmp_path, base_url=mock_api, model="echo")
+    env["TERM"] = "xterm-256color"
+    result = subprocess.run(
+        ["script", "-qec", f"{sys.executable} -m phoenix_cli", "/dev/null"],
+        input="hello bare phoenix\n/exit\n",
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=REPO_ROOT,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "hello bare phoenix" in result.stdout  # the echoed reply
+
+
+def test_chat_typed_ahead_messages_not_lost(tmp_path):
+    """Messages typed while a reply is still streaming must all be sent,
+    in the exact order they were typed (1.0.3 regression: fast typing)."""
+    server = _SlowStreamHandler()
+    try:
+        env = make_env(tmp_path, base_url=server.base_url, model="slow")
+        env["TERM"] = "xterm-256color"
+        schedule = [
+            (1.0, b"msg-1\n"),
+            (1.8, b"msg-2\n"),
+            (2.6, b"msg-3\n"),
+            (3.4, b"msg-4\n"),
+            (10.0, b"/exit\n"),
+        ]
+        out = _drive_pty([], schedule, env)
+        assert server.received == ["msg-1", "msg-2", "msg-3", "msg-4"], (
+            f"messages lost/reordered: {server.received!r}"
+        )
+        assert "Bye!" in out
+    finally:
+        server.close()
+
+
+def test_chat_ctrl_c_cancels_reply_and_keeps_going(tmp_path):
+    """Ctrl+C mid-reply cancels that reply; the next message still works."""
+    server = _SlowStreamHandler()
+    try:
+        env = make_env(tmp_path, base_url=server.base_url, model="slow")
+        env["TERM"] = "xterm-256color"
+        schedule = [
+            (1.0, b"first\n"),
+            (2.5, b"\x03"),          # Ctrl+C while streaming
+            (4.0, b"second\n"),
+            (8.0, b"/exit\n"),
+        ]
+        out = _drive_pty([], schedule, env)
+        assert server.received == ["first", "second"], server.received
+        assert "interrupted" in out
+        assert "Bye!" in out
+    finally:
+        server.close()
+
+
+# ---------------------------------------------------------------------------
+# MCP command surface
+# ---------------------------------------------------------------------------
+
+def test_mcp_add_roblox_writes_working_config(tmp_path, monkeypatch):
+    """`phoenix mcp add-roblox` writes a real, existing npm package."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from phoenix_cli.cli import ROBLOX_MCP_COMMAND
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mcp", "add-roblox"], input="n\n")
+    assert result.exit_code == 0, result.output
+    assert "robloxstudio-mcp" in result.output
+
+    from phoenix_cli.mcp import load_mcp_config
+
+    servers = load_mcp_config()
+    assert len(servers) == 1
+    assert servers[0]["name"] == "roblox"
+    assert servers[0]["command"] == ROBLOX_MCP_COMMAND
+    assert "@anthropic" not in json.dumps(servers)  # the phantom package
+
+
+def test_mcp_add_roblox_replaces_existing_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from phoenix_cli.mcp import load_mcp_config, save_mcp_config
+
+    save_mcp_config([{"name": "roblox", "command": ["npx", "bogus-pkg"]}])
+    result = CliRunner().invoke(cli, ["mcp", "add-roblox"], input="n\n")
+    assert result.exit_code == 0, result.output
+    servers = load_mcp_config()
+    assert len(servers) == 1
+    assert servers[0]["command"][-1] == "robloxstudio-mcp@latest"
